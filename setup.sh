@@ -1,235 +1,257 @@
 #!/usr/bin/env bash
-# VLESS-REALITY + TUIC 一键安装脚本（安全版 v2）
+# VLESS-REALITY + TUIC 一键安装脚本（修复版 v3）
 
-set -uo pipefail
+set -e
 
-############## 通用函数 ##############
+# ========= 通用输出函数 =========
+info()  { echo -e "\033[32m[INFO]\033[0m  $*"; }
+warn()  { echo -e "\033[33m[WARN]\033[0m  $*"; }
+error() { echo -e "\033[31m[ERR ]\033[0m  $*"; }
+sep()   { echo -e "\033[36m====================================================\033[0m"; }
 
-log()  { echo -e "\033[32m[INFO]\033[0m $*"; }
-warn() { echo -e "\033[33m[WARN]\033[0m $*"; }
-err()  { echo -e "\033[31m[ERR ]\033[0m $*" >&2; }
+CONFIG_DIR="/etc/sing-box"
+CONFIG_PATH="${CONFIG_DIR}/config.json"
+REALITY_TXT="${CONFIG_DIR}/reality.txt"
+SERVICE_FILE="/etc/systemd/system/sing-box.service"
+ARCH=""
+SINGBOX_BIN="/usr/local/bin/sing-box"
 
-need_cmd() {
-  command -v "$1" >/dev/null 2>&1 || {
-    err "缺少命令: $1"
-    exit 1
-  }
-}
-
-############## 安装基础依赖 ##############
-
-install_base() {
-  if command -v apt-get >/dev/null 2>&1; then
-    log "检测到 Debian/Ubuntu 系统，安装依赖..."
-    apt-get update -y
-    apt-get install -y curl wget jq openssl qrencode
-  elif command -v yum >/dev/null 2>&1; then
-    log "检测到 CentOS/RHEL 系统，安装依赖..."
-    yum install -y epel-release
-    yum install -y curl wget jq openssl qrencode
-  else
-    err "无法识别的系统（非 apt / yum），请手动安装 curl、wget、jq、openssl。"
+# ========= 检查 root & 系统 =========
+check_root() {
+  if [[ $EUID -ne 0 ]]; then
+    error "请使用 root 用户运行此脚本（sudo -i 再执行）。"
     exit 1
   fi
 }
 
-############## 安装最新 sing-box ##############
+check_os() {
+  if [[ -f /etc/os-release ]]; then
+    . /etc/os-release
+    case "$ID" in
+      ubuntu|debian)
+        info "检测到系统: $PRETTY_NAME"
+        ;;
+      *)
+        warn "未在 Ubuntu/Debian 上测试，当前为: $PRETTY_NAME"
+        ;;
+    esac
+  fi
+}
 
-install_sing_box() {
-  ARCH=$(uname -m)
-  case "$ARCH" in
-    x86_64) SB_ARCH="amd64" ;;
-    aarch64|arm64) SB_ARCH="arm64" ;;
+# ========= 检测 CPU 架构 =========
+detect_arch() {
+  local raw_arch
+  raw_arch=$(uname -m)
+  case "$raw_arch" in
+    x86_64|amd64)
+      ARCH="amd64"
+      ;;
+    aarch64|arm64)
+      ARCH="arm64"
+      ;;
+    armv7*|armv6*)
+      ARCH="armv7"
+      ;;
     *)
-      err "不支持的 CPU 架构: $ARCH"
+      error "不支持的架构: $raw_arch"
       exit 1
       ;;
   esac
+  info "检测到架构: $raw_arch ($ARCH)"
+}
 
-  log "检测并安装最新 sing-box ..."
+# ========= 安装依赖 =========
+install_deps() {
+  info "更新 apt 源并安装依赖（curl jq qrencode openssl）..."
+  apt-get update -y
+  apt-get install -y curl jq qrencode openssl
+}
 
-  # 用 GitHub API 获取最新 tag，例如 v1.14.3
-  local LATEST_TAG
-  LATEST_TAG=$(curl -fsSL "https://api.github.com/repos/SagerNet/sing-box/releases/latest" | jq -r '.tag_name')
-  if [ -z "$LATEST_TAG" ] || [ "$LATEST_TAG" = "null" ]; then
-    err "获取 sing-box 最新版本号失败，请稍后重试。"
+# ========= 获取 sing-box 最新版本 =========
+get_latest_singbox_version() {
+  # 使用 GitHub API 获取最新 tag
+  local api_url="https://api.github.com/repos/SagerNet/sing-box/releases/latest"
+  info "检测并安装最新 sing-box ..."
+  local latest_tag
+  latest_tag=$(curl -fsSL "$api_url" | jq -r '.tag_name' 2>/dev/null || echo "")
+  if [[ -z "$latest_tag" || "$latest_tag" == "null" ]]; then
+    # 兜底版本（如果 API 失败）
+    latest_tag="v1.12.12"
+    warn "获取最新版本失败，将使用兜底版本: $latest_tag"
+  fi
+  echo "$latest_tag"
+}
+
+install_singbox() {
+  local latest_tag
+  latest_tag=$(get_latest_singbox_version)
+  local url="https://github.com/SagerNet/sing-box/releases/download/${latest_tag}/sing-box-${latest_tag#v}-linux-${ARCH}.tar.gz"
+
+  info "下载并安装 sing-box ${latest_tag} (${ARCH}) ..."
+  mkdir -p /tmp/singbox-install
+  cd /tmp/singbox-install
+
+  if ! curl -fSL "$url" -o singbox.tar.gz; then
+    error "下载 sing-box 失败: $url"
     exit 1
   fi
 
-  # 目录用 tag（带 v），文件名用去掉 v 的版本号
-  # 如：tag = v1.14.3 → VER = 1.14.3
-  local VER
-  VER="${LATEST_TAG#v}"
-
-  local SB_URL="https://github.com/SagerNet/sing-box/releases/download/${LATEST_TAG}/sing-box-${VER}-linux-${SB_ARCH}.tar.gz"
-  log "下载并安装 sing-box ${LATEST_TAG} (${SB_ARCH}) ..."
-  cd /tmp
-  wget -O sb.tar.gz "$SB_URL"
-  tar -xzf sb.tar.gz
-
-  # 解压出来的目录名类似 sing-box-1.14.3-linux-amd64
-  local SB_DIR
-  SB_DIR=$(tar -tzf sb.tar.gz | head -n 1 | cut -d/ -f1)
-  install -m 755 "${SB_DIR}/sing-box" /usr/local/bin/sing-box
-
-  rm -rf "${SB_DIR}" sb.tar.gz
-
-  log "sing-box 安装完成: $(sing-box version)"
-}
-
-############## Reality 域名测试与选择 ##############
-
-# 你的域名池（Gist）
-GIST_URL="https://gist.githubusercontent.com/cj3343/8d38d603440ea50105319d7c09909faf/raw/47e05fcfdece890d1480f462afadc0baffcbb120/domain-list.txt"
-
-download_domain_list() {
-  mkdir -p /tmp/sb-reality
-  local FILE="/tmp/sb-reality/domain-list.txt"
-
-  if curl -fsSL "$GIST_URL" -o "$FILE"; then
-    log "已从 Gist 拉取 Reality 域名池：$FILE"
-  else
-    warn "从 Gist 拉取域名池失败，使用内置备用列表。"
-    cat > "$FILE" <<EOF
-apple.com
-www.apple.com
-nvidia.com
-www.nvidia.com
-www.microsoft.com
-www.spotify.com
-www.tesla.com
-s3.amazonaws.com
-awsstatic.com
-www.whatsapp.com
-www.netflix.com
-www.google.com
-www.cloudflare.com
-EOF
+  tar -xzf singbox.tar.gz
+  local dir
+  dir=$(find . -maxdepth 1 -type d -name "sing-box-*" | head -n 1)
+  if [[ ! -d "$dir" ]]; then
+    error "解压后未找到 sing-box 目录"
+    exit 1
   fi
+
+  install -m 755 "$dir/sing-box" "$SINGBOX_BIN"
+  cd /
+  rm -rf /tmp/singbox-install
+
+  info "sing-box 安装完成: $SINGBOX_BIN"
 }
 
-test_domains_latency() {
-  local FILE="/tmp/sb-reality/domain-list.txt"
-  [ -f "$FILE" ] || download_domain_list
+# ========= 域名延迟测试（从你的 Gist 拉取） =========
+test_reality_domains() {
+  local GIST_URL="https://gist.githubusercontent.com/cj3343/8d38d603440ea50105319d7c09909faf/raw/47e05fcfdece890d1480f462afadc0baffcbb120/domain-list.txt"
+  local domain_list
+  domain_list=$(curl -fsSL "$GIST_URL" || true)
 
-  log "开始测试 Reality 目标域名延迟（openssl + 443）..."
+  if [[ -z "$domain_list" ]]; then
+    warn "从 Gist 获取域名失败，将使用内置域名池..."
+    domain_list=$'aws.com\nwhatsapp.com\napple.com\nlpsnmedia.net\nnetflix.com\ngoogle.com\ntesla.com\nspotify.com\nicloud.com\ncloudflare.com'
+  fi
+
+  info "开始测试 Reality 目标域名延迟（openssl + 443）..."
 
   local best_domain=""
-  local best_ms=999999
+  local best_rtt=999999
 
-  # 随机抽 12 个域名测试
+  # 只测前 20 个域名，避免太久
+  local count=0
   while read -r d; do
-    [ -z "$d" ] && continue
-    local t1 t2 cost
+    [[ -z "$d" ]] && continue
+    ((count++))
+    if (( count > 20 )); then
+      break
+    fi
+
+    local t1 t2 rtt
     t1=$(date +%s%3N)
-    if timeout 1 openssl s_client -connect "$d:443" -servername "$d" </dev/null >/dev/null 2>&1; then
+    if timeout 1 openssl s_client -connect "$d:443" -servername "$d" </dev/null &>/dev/null; then
       t2=$(date +%s%3N)
-      cost=$((t2 - t1))
-      printf "  %-30s %4s ms\n" "$d" "$cost"
-      if [ "$cost" -lt "$best_ms" ]; then
-        best_ms="$cost"
+      rtt=$((t2 - t1))
+      echo "  $d: ${rtt} ms"
+      if (( rtt < best_rtt )); then
+        best_rtt=$rtt
         best_domain="$d"
       fi
     else
-      printf "  %-30s timeout\n" "$d"
+      echo "  $d: timeout"
     fi
-  done < <(shuf "$FILE" | head -n 12)
+  done <<< "$domain_list"
 
-  if [ -z "$best_domain" ]; then
-    warn "所有测试域名均超时，请手动输入一个能 443 访问的大站域名。"
-  else
-    log "✅ 当前测速最优域名：$best_domain (${best_ms} ms)"
+  if [[ -z "$best_domain" ]]; then
+    warn "所有域名测试均失败，将使用默认: www.apple.com"
+    best_domain="www.apple.com"
+    best_rtt=0
   fi
 
-  # 向上层返回：best_domain, best_ms
-  REALITY_BEST_DOMAIN="$best_domain"
-  REALITY_BEST_MS="$best_ms"
+  info "✅ 选中的最低延迟域名：$best_domain (${best_rtt} ms)"
+  echo "$best_domain"
 }
 
-choose_reality_domain() {
-  download_domain_list
-  test_domains_latency
+ask_reality_domain() {
+  local auto_domain
+  auto_domain=$(test_reality_domains)
 
   while true; do
-    if [ -n "${REALITY_BEST_DOMAIN:-}" ]; then
-      echo
-      echo "[INFO] 当前测速最优：${REALITY_BEST_DOMAIN} (${REALITY_BEST_MS} ms)"
-      read -rp "Reality 伪装域名 [回车用当前最优 / 输入 r 重新测速 / 输入自定义域名]：" input
-      case "$input" in
-        "")
-          REALITY_DOMAIN="$REALITY_BEST_DOMAIN"
-          break
-          ;;
-        r|R)
-          test_domains_latency
-          ;;
-        *)
-          REALITY_DOMAIN="$input"
-          break
-          ;;
-      esac
-    else
-      read -rp "Reality 伪装域名（例如 www.apple.com / nvidia.com）：" input
-      if [ -n "$input" ]; then
-        REALITY_DOMAIN="$input"
-        break
-      fi
-    fi
-  done
+    read -r -p "Reality 伪装域名 [回车使用自动选择: ${auto_domain}]：" input_domain
+    input_domain=${input_domain:-$auto_domain}
 
-  log "✅ 最终使用的 Reality 伪装域名：$REALITY_DOMAIN"
+    # 简单校验：必须包含 .
+    if [[ "$input_domain" != *.* ]]; then
+      warn "域名格式不正确，请重新输入。"
+      continue
+    fi
+
+    echo "$input_domain"
+    return
+  done
 }
 
-############## 生成 Reality 密钥 / UUID 等 ##############
+ask_ports() {
+  local vless_port tuic_port
+  read -r -p "VLESS Reality 端口 [默认: 443]: " vless_port
+  read -r -p "TUIC 端口 [默认: 8443]: " tuic_port
 
-generate_reality_keys() {
-  mkdir -p /etc/sing-box
-  cd /etc/sing-box
+  vless_port=${vless_port:-443}
+  tuic_port=${tuic_port:-8443}
 
-  log "生成 Reality 密钥对..."
-  sing-box generate reality-keypair > /etc/sing-box/reality.txt
+  info "✅ VLESS 端口: $vless_port"
+  info "✅ TUIC  端口: $tuic_port"
 
-  REALITY_PRIVATE=$(grep -i "PrivateKey" /etc/sing-box/reality.txt | awk '{print $2}')
-  REALITY_PUBLIC=$(grep -i "PublicKey"  /etc/sing-box/reality.txt | awk '{print $2}')
+  echo "$vless_port $tuic_port"
+}
 
-  if [ -z "$REALITY_PRIVATE" ] || [ -z "$REALITY_PUBLIC" ]; then
-    err "解析 Reality 密钥失败，请检查 /etc/sing-box/reality.txt"
+# ========= 生成 UUID & Reality 密钥 =========
+generate_uuid() {
+  uuidgen | tr 'A-Z' 'a-z'
+}
+
+generate_reality_keypair() {
+  mkdir -p "$CONFIG_DIR"
+  cd "$CONFIG_DIR"
+
+  # sing-box generate reality-keypair 没有 --json，只能直接解析 stdout
+  local output
+  output=$($SINGBOX_BIN generate reality-keypair 2>/dev/null)
+
+  # 兼容两种格式：
+  # 1) PrivateKey: xxx / PublicKey: yyy
+  # 2) { "private_key": "...", "public_key": "..." }
+  local pri pub
+
+  if echo "$output" | grep -qi "PrivateKey:"; then
+    pri=$(echo "$output" | grep -i "PrivateKey" | awk '{print $2}')
+    pub=$(echo "$output" | grep -i "PublicKey"  | awk '{print $2}')
+  else
+    pri=$(echo "$output" | jq -r '.private_key' 2>/dev/null || true)
+    pub=$(echo "$output" | jq -r '.public_key'  2>/dev/null || true)
+  fi
+
+  if [[ -z "$pri" || -z "$pub" || "$pri" == "null" || "$pub" == "null" ]]; then
+    error "解析 Reality 密钥失败，原始输出："
+    echo "$output"
     exit 1
   fi
 
-  # 生成 short_id（16位 hex）
-  SHORT_ID=$(tr -dc 'a-f0-9' </dev/urandom | head -c 16)
+  echo "PrivateKey: $pri" > "$REALITY_TXT"
+  echo "PublicKey:  $pub" >> "$REALITY_TXT"
 
-  log "Reality 私钥: $REALITY_PRIVATE"
-  log "Reality 公钥: $REALITY_PUBLIC"
-  log "Reality Short ID: $SHORT_ID"
+  info "Reality 密钥已保存到 $REALITY_TXT"
+
+  # 返回给调用者
+  echo "$pri|$pub"
 }
 
-generate_uuid() {
-  if command -v uuidgen >/dev/null 2>&1; then
-    uuidgen
-  else
-    cat /proc/sys/kernel/random/uuid
-  fi
-}
-
-############## 写入 sing-box 配置 ##############
-
+# ========= 写入 config.json =========
 write_config() {
-  local VLESS_PORT="$1"
-  local TUIC_PORT="$2"
-  local VLESS_UUID="$3"
-  local TUIC_UUID="$4"
-  local TUIC_PASS="$5"
+  local uuid="$1"
+  local reality_domain="$2"
+  local vless_port="$3"
+  local tuic_port="$4"
+  local reality_pri="$5"
+  local reality_sid="$6"
 
-  mkdir -p /etc/sing-box
+  mkdir -p "$CONFIG_DIR"
 
-  if [ -f /etc/sing-box/config.json ]; then
-    cp /etc/sing-box/config.json "/etc/sing-box/config.json.bak-$(date +%s)"
-    warn "已备份旧 config.json 为 config.json.bak-时间戳"
+  if [[ -f "$CONFIG_PATH" ]]; then
+    cp "$CONFIG_PATH" "${CONFIG_PATH}.bak-$(date +%s)"
+    warn "已备份旧 config.json 为 ${CONFIG_PATH}.bak-时间戳"
   fi
 
-  cat > /etc/sing-box/config.json <<EOF
+  cat > "$CONFIG_PATH" <<EOF
 {
   "log": {
     "level": "info",
@@ -239,13 +261,11 @@ write_config() {
     "servers": [
       {
         "tag": "google",
-        "address": "https://dns.google/dns-query",
-        "strategy": "ipv4_only"
+        "address": "https://dns.google/dns-query"
       },
       {
         "tag": "local",
-        "address": "local",
-        "detour": "direct"
+        "address": "local"
       }
     ]
   },
@@ -254,21 +274,26 @@ write_config() {
       "type": "vless",
       "tag": "vless-reality",
       "listen": "::",
-      "listen_port": ${VLESS_PORT},
+      "listen_port": ${vless_port},
+      "sniff": true,
+      "sniff_override_destination": true,
       "users": [
         {
-          "uuid": "${VLESS_UUID}",
+          "uuid": "${uuid}",
           "flow": "xtls-rprx-vision"
         }
       ],
       "tls": {
         "enabled": true,
-        "server_name": "${REALITY_DOMAIN}",
+        "server_name": "${reality_domain}",
         "reality": {
           "enabled": true,
-          "handshake": "${REALITY_DOMAIN}",
-          "private_key": "${REALITY_PRIVATE}",
-          "short_id": ["${SHORT_ID}"]
+          "handshake": {
+            "server": "${reality_domain}",
+            "server_port": 443
+          },
+          "private_key": "${reality_pri}",
+          "short_id": ["${reality_sid}"]
         }
       }
     },
@@ -276,23 +301,22 @@ write_config() {
       "type": "tuic",
       "tag": "tuic",
       "listen": "::",
-      "listen_port": ${TUIC_PORT},
+      "listen_port": ${tuic_port},
       "users": [
         {
-          "uuid": "${TUIC_UUID}",
-          "password": "${TUIC_PASS}"
+          "uuid": "${uuid}",
+          "password": "${uuid}"
         }
       ],
       "congestion_control": "bbr",
+      "zero_rtt_handshake": true,
+      "udp_relay_mode": "native",
+      "heartbeat": "10s",
       "tls": {
         "enabled": true,
-        "server_name": "${REALITY_DOMAIN}",
-        "reality": {
-          "enabled": true,
-          "handshake": "${REALITY_DOMAIN}",
-          "private_key": "${REALITY_PRIVATE}",
-          "short_id": ["${SHORT_ID}"]
-        }
+        "server_name": "${reality_domain}",
+        "insecure": true,
+        "alpn": ["h3"]
       }
     }
   ],
@@ -307,159 +331,190 @@ write_config() {
     }
   ],
   "route": {
-    "auto_detect_interface": true,
+    "geoip": {
+      "download_url": "https://github.com/SagerNet/sing-geoip/releases/latest/download/geoip.db",
+      "download_detour": "direct"
+    },
+    "geosite": {
+      "download_url": "https://github.com/SagerNet/sing-geosite/releases/latest/download/geosite.db",
+      "download_detour": "direct"
+    },
     "rules": [
       {
-        "protocol": ["bittorrent"],
+        "rule_set": "geosite-category-ads-all",
         "outbound": "block"
+      },
+      {
+        "geoip": [
+          "private"
+        ],
+        "outbound": "direct"
+      },
+      {
+        "geosite": [
+          "cn"
+        ],
+        "geoip": [
+          "cn"
+        ],
+        "outbound": "direct"
       }
     ],
-    "final": "direct"
+    "rule_set": [
+      {
+        "tag": "geosite-category-ads-all",
+        "type": "remote",
+        "format": "binary",
+        "url": "https://github.com/SagerNet/sing-geosite/releases/latest/download/geosite-category-ads-all.srs",
+        "download_detour": "direct"
+      }
+    ]
   }
 }
 EOF
 
-  log "配置写入完成，开始检查 JSON 合法性..."
-  if ! sing-box check -c /etc/sing-box/config.json; then
-    err "配置检查失败，请手动修复 /etc/sing-box/config.json 后重试。"
-    exit 1
-  fi
-  log "配置合法 ✅"
+  info "写入 /etc/sing-box/config.json ..."
 }
 
-############## systemd 服务 ##############
-
-setup_systemd() {
-  cat > /etc/systemd/system/sing-box.service <<EOF
+# ========= 写入 systemd service =========
+write_service() {
+  cat > "$SERVICE_FILE" <<EOF
 [Unit]
 Description=Sing-box Service
-After=network-online.target
-Wants=network-online.target
+After=network.target
 
 [Service]
-Type=simple
-ExecStart=/usr/local/bin/sing-box run -c /etc/sing-box/config.json
+User=root
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+ExecStart=${SINGBOX_BIN} run -c ${CONFIG_PATH}
 Restart=on-failure
-RestartSec=5s
-LimitNOFILE=51200
+LimitNOFILE=1048576
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
   systemctl daemon-reload
-  systemctl enable sing-box >/dev/null 2>&1 || true
+  systemctl enable sing-box
+}
+
+# ========= 生成分享链接 & 二维码 =========
+generate_links_and_qr() {
+  local uuid="$1"
+  local reality_domain="$2"
+  local vless_port="$3"
+  local tuic_port="$4"
+  local reality_pub="$5"
+  local reality_sid="$6"
+
+  # 获取 IPv4
+  local ipv4
+  ipv4=$(curl -4s https://api-ipv4.ip.sb || curl -4s ifconfig.me || echo "YOUR_IP")
+
+  local vless_url="vless://${uuid}@${ipv4}:${vless_port}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${reality_domain}&fp=chrome&pbk=${reality_pub}&sid=${reality_sid}&type=tcp#VLESS-REALITY"
+  local tuic_url="tuic://${uuid}:${uuid}@${ipv4}:${tuic_port}?congestion_control=bbr&udp_relay_mode=native&alpn=h3&allow_insecure=1#TUIC-H3"
+
+  sep
+  echo "VLESS Reality 链接："
+  echo "$vless_url"
+  sep
+  echo "TUIC 链接："
+  echo "$tuic_url"
+  sep
+
+  # 生成二维码（放在当前目录）
+  qrencode -t ansiutf8 "$vless_url" > /root/vless-reality-qr.txt || true
+  qrencode -t ansiutf8 "$tuic_url"  > /root/tuic-qr.txt || true
+
+  echo "已在 /root 生成二维码文本："
+  echo "  /root/vless-reality-qr.txt"
+  echo "  /root/tuic-qr.txt"
+}
+
+# ========= 主流程 =========
+main() {
+  check_root
+  check_os
+  detect_arch
+  install_deps
+  install_singbox
+
+  sep
+  info "Reality 伪装域名 & 端口配置"
+  sep
+
+  local rd
+  rd=$(ask_reality_domain)
+
+  local vp tp
+  read vp tp <<<"$(ask_ports)"
+
+  sep
+  info "生成 UUID & Reality 密钥对 ..."
+  sep
+
+  local uuid
+  uuid=$(generate_uuid)
+
+  local keypair reality_pri reality_pub
+  keypair=$(generate_reality_keypair)
+  reality_pri="${keypair%%|*}"
+  reality_pub="${keypair##*|}"
+
+  # 生成随机 short_id（16 个十六进制字符）
+  local sid
+  sid=$(head -c 8 /dev/urandom | od -An -tx1 | tr -d ' \n')
+  [[ -z "$sid" ]] && sid="65d8a7718e29e3cf"
+
+  info "UUID:        $uuid"
+  info "Reality Pri: $reality_pri"
+  info "Reality Pub: $reality_pub"
+  info "Reality SID: $sid"
+
+  sep
+  info "写入配置文件 ..."
+  sep
+
+  write_config "$uuid" "$rd" "$vp" "$tp" "$reality_pri" "$sid"
+
+  sep
+  info "检查配置合法性 ..."
+  sep
+
+  if ! $SINGBOX_BIN check -c "$CONFIG_PATH"; then
+    error "配置检查失败，请手动修复 $CONFIG_PATH 后重试。"
+    exit 1
+  fi
+
+  sep
+  info "配置通过，写入 systemd 并启动服务 ..."
+  sep
+
+  write_service
   systemctl restart sing-box
 
   sleep 1
-  systemctl --no-pager -l status sing-box | sed -n '1,15p'
-}
-
-############## IP 检测 ##############
-
-detect_ipv4() {
-  local ip cand
-  ip=$(curl -4s --max-time 5 https://api.ip.sb 2>/dev/null || true)
-  cand=$(echo "$ip" | grep -Eo '([0-9]{1,3}\.){3}[0-9]{1,3}' | head -n1)
-  if [ -z "$cand" ]; then
-    ip=$(curl -4s --max-time 5 https://ifconfig.me 2>/dev/null || true)
-    cand=$(echo "$ip" | grep -Eo '([0-9]{1,3}\.){3}[0-9]{1,3}' | head -n1)
-  fi
-  if [ -z "$cand" ]; then
-    ip=$(curl -4s --max-time 5 https://ipv4.icanhazip.com 2>/dev/null || true)
-    cand=$(echo "$ip" | grep -Eo '([0-9]{1,3}\.){3}[0-9]{1,3}' | head -n1)
-  fi
-  echo "$cand"
-}
-
-############## 生成分享链接 & 二维码 ##############
-
-gen_share_links() {
-  local VLESS_PORT="$1"
-  local TUIC_PORT="$2"
-  local VLESS_UUID="$3"
-  local TUIC_UUID="$4"
-  local TUIC_PASS="$5"
-
-  echo
-  local SERVER_IP
-  read -rp "服务器公网 IPv4 [回车自动检测]：" SERVER_IP
-  if [ -z "$SERVER_IP" ]; then
-    SERVER_IP=$(detect_ipv4)
-  fi
-  if [ -z "$SERVER_IP" ]; then
-    err "自动检测 IP 失败，请重新运行脚本中的链接生成部分或手动写 IP。"
-    return
-  fi
-
-  local VLESS_URL="vless://${VLESS_UUID}@${SERVER_IP}:${VLESS_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${REALITY_DOMAIN}&fp=chrome&pbk=${REALITY_PUBLIC}&sid=${SHORT_ID}&type=tcp#VLESS-REALITY"
-  local TUIC_URL="tuic://${TUIC_UUID}:${TUIC_PASS}@${SERVER_IP}:${TUIC_PORT}?congestion_control=bbr&udp_relay_mode=quic&alpn=h3&sni=${REALITY_DOMAIN}&allow_insecure=0#TUIC-REALITY"
-
-  mkdir -p /etc/sing-box
-  cat > /etc/sing-box/share-links.txt <<EOF
-VLESS-REALITY:
-${VLESS_URL}
-
-TUIC-REALITY:
-${TUIC_URL}
-EOF
-
-  echo
-  echo "================= 分享链接（已保存到 /etc/sing-box/share-links.txt） ================="
-  echo "VLESS-REALITY:"
-  echo "$VLESS_URL"
-  echo
-  echo "TUIC-REALITY:"
-  echo "$TUIC_URL"
-  echo "==============================================================================="
-
-  if command -v qrencode >/dev/null 2>&1; then
-    echo
-    log "生成二维码 PNG（保存在 /etc/sing-box/）..."
-    echo "$VLESS_URL" | qrencode -o /etc/sing-box/vless.png
-    echo "$TUIC_URL"  | qrencode -o /etc/sing-box/tuic.png
-    log "二维码文件：/etc/sing-box/vless.png, /etc/sing-box/tuic.png"
-    log "可用 FinalShell / SFTP 下载到本地，用手机扫码导入。"
+  if systemctl is-active --quiet sing-box; then
+    info "sing-box 已成功启动。"
   else
-    warn "未安装 qrencode，已跳过二维码生成。"
+    error "sing-box 启动失败，请使用 'journalctl -u sing-box -e' 查看日志。"
+    exit 1
   fi
-}
 
-############## 主流程 ##############
+  sep
+  info "生成分享链接与二维码 ..."
+  sep
 
-main() {
-  need_cmd curl
-  need_cmd wget
-  need_cmd jq
+  generate_links_and_qr "$uuid" "$rd" "$vp" "$tp" "$reality_pub" "$sid"
 
-  install_base
-  install_sing_box
-  choose_reality_domain
-  generate_reality_keys
-
-  echo
-  read -rp "VLESS Reality 端口 [默认: 443]：" VLESS_PORT
-  VLESS_PORT=${VLESS_PORT:-443}
-  read -rp "TUIC 端口 [默认: 8443]：" TUIC_PORT
-  TUIC_PORT=${TUIC_PORT:-8443}
-  log "✅ VLESS 端口: ${VLESS_PORT}"
-  log "✅ TUIC  端口: ${TUIC_PORT}"
-
-  local VLESS_UUID TUIC_UUID TUIC_PASS
-  VLESS_UUID=$(generate_uuid)
-  TUIC_UUID=$(generate_uuid)
-  TUIC_PASS=$(generate_uuid)
-
-  write_config "$VLESS_PORT" "$TUIC_PORT" "$VLESS_UUID" "$TUIC_UUID" "$TUIC_PASS"
-  setup_systemd
-  gen_share_links "$VLESS_PORT" "$TUIC_PORT" "$VLESS_UUID" "$TUIC_UUID" "$TUIC_PASS"
-
-  echo
-  log "🎉 全部完成！"
+  sep
+  echo "全部完成！"
   echo "提示："
-  echo "1）安卓 NekoBox / v2rayNG：直接导入 vless:// 或 tuic:// 链接即可；"
+  echo "1）安卓 NekoBox：直接导入 vless:// 或 tuic:// 即可；"
   echo "2）Mac Surge / sing-box / Nekoray：新建节点 → 粘贴链接导入；"
-  echo "3）二维码 PNG 在 /etc/sing-box/ 下，可扫码快速导入。"
+  echo "3）后续你可以把 VLESS_URL / TUIC_URL 直接发给朋友或写进 README/X 帖子。"
+  sep
 }
 
 main "$@"
