@@ -16,281 +16,6 @@ need_cmd() {
   }
 }
 
-############## 清理旧配置 ##############
-
-clean_old_install() {
-  log "开始清理旧的 sing-box 配置和数据..."
-  
-  # 停止服务
-  if systemctl is-active --quiet sing-box 2>/dev/null; then
-    log "停止 sing-box 服务..."
-    systemctl stop sing-box
-  fi
-  
-  # 禁用服务
-  if systemctl is-enabled --quiet sing-box 2>/dev/null; then
-    log "禁用 sing-box 服务..."
-    systemctl disable sing-box
-  fi
-  
-  # 删除服务文件
-  if [ -f /etc/systemd/system/sing-box.service ]; then
-    log "删除 systemd 服务文件..."
-    rm -f /etc/systemd/system/sing-box.service
-    systemctl daemon-reload
-  fi
-  
-  # 备份并删除配置目录
-  if [ -d /etc/sing-box ]; then
-    local backup_name="/root/sing-box-backup-$(date +%Y%m%d-%H%M%S).tar.gz"
-    log "备份旧配置到: $backup_name"
-    tar -czf "$backup_name" /etc/sing-box/ 2>/dev/null || true
-    log "删除旧配置目录..."
-    rm -rf /etc/sing-box
-  fi
-  
-  # 清理临时文件
-  if [ -d /tmp/sb-reality ]; then
-    rm -rf /tmp/sb-reality
-  fi
-  rm -f /tmp/sing-box-config-*.json 2>/dev/null || true
-  rm -f /tmp/sb.tar.gz 2>/dev/null || true
-  
-  log "✅ 清理完成！旧配置已备份到 /root/"
-  echo
-}
-
-show_menu() {
-  echo "========================================"
-  echo "   Sing-box VPN 一键安装脚本"
-  echo "========================================"
-  echo "1. 全新安装（推荐）"
-  echo "2. 清理旧配置后重新安装"
-  echo "3. 仅清理配置（不安装）"
-  echo "4. 卸载 sing-box"
-  echo "5. 查看当前配置"
-  echo "6. 诊断连接问题"
-  echo "7. 🔥 彻底清理并重装（完全重置）"
-  echo "0. 退出"
-  echo "========================================"
-  echo
-}
-
-deep_clean() {
-  warn "⚠️  此操作将："
-  echo "  - 停止并删除 sing-box 服务"
-  echo "  - 删除所有配置文件（包括备份）"
-  echo "  - 删除 sing-box 程序"
-  echo "  - 清理所有临时文件"
-  echo
-  read -rp "确认执行彻底清理？(yes/no): " confirm
-  
-  if [ "$confirm" != "yes" ]; then
-    log "已取消"
-    return
-  fi
-  
-  log "开始彻底清理..."
-  
-  # 停止服务
-  systemctl stop sing-box 2>/dev/null || true
-  systemctl disable sing-box 2>/dev/null || true
-  
-  # 删除服务文件
-  rm -f /etc/systemd/system/sing-box.service
-  systemctl daemon-reload
-  
-  # 删除程序
-  rm -f /usr/local/bin/sing-box
-  
-  # 完全删除配置目录（不备份）
-  rm -rf /etc/sing-box
-  
-  # 清理临时文件
-  rm -rf /tmp/sb-reality
-  rm -f /tmp/sing-box-config-*.json 2>/dev/null || true
-  rm -f /tmp/sb.tar.gz 2>/dev/null || true
-  
-  # 清理旧备份
-  rm -f /root/sing-box-backup-*.tar.gz 2>/dev/null || true
-  rm -f /root/sing-box-final-backup-*.tar.gz 2>/dev/null || true
-  
-  log "✅ 彻底清理完成！系统已恢复到初始状态"
-  echo
-}
-
-diagnose_connection() {
-  echo "========================================"
-  echo "🔍 开始诊断连接问题"
-  echo "========================================"
-  echo
-  
-  # 1. 检查服务状态
-  log "1. 检查 sing-box 服务状态..."
-  if systemctl is-active --quiet sing-box; then
-    echo "✅ 服务正在运行"
-  else
-    err "❌ 服务未运行！"
-    echo "尝试启动服务："
-    systemctl start sing-box
-    sleep 2
-    systemctl status sing-box --no-pager -l | head -n 15
-  fi
-  echo
-  
-  # 2. 检查端口监听
-  log "2. 检查端口监听状态..."
-  if command -v ss >/dev/null 2>&1; then
-    ss -tulnp | grep sing-box || warn "未找到 sing-box 监听端口"
-  else
-    netstat -tulnp | grep sing-box || warn "未找到 sing-box 监听端口"
-  fi
-  echo
-  
-  # 3. 检查配置文件
-  log "3. 检查配置文件..."
-  if [ -f /etc/sing-box/config.json ]; then
-    echo "✅ 配置文件存在"
-    if sing-box check -c /etc/sing-box/config.json 2>&1 | grep -q "configuration valid"; then
-      echo "✅ 配置文件语法正确"
-    else
-      err "❌ 配置文件有问题！"
-      sing-box check -c /etc/sing-box/config.json
-    fi
-  else
-    err "❌ 配置文件不存在！"
-  fi
-  echo
-  
-  # 4. 检查防火墙
-  log "4. 检查防火墙状态..."
-  if command -v ufw >/dev/null 2>&1; then
-    if ufw status | grep -q "Status: active"; then
-      echo "防火墙已启用，检查端口规则："
-      ufw status | grep -E "443|8443"
-      if ! ufw status | grep -q "443"; then
-        warn "⚠️  443 端口未开放！运行以下命令开放："
-        echo "  ufw allow 443/tcp"
-      fi
-      if ! ufw status | grep -q "8443"; then
-        warn "⚠️  8443 端口未开放！运行以下命令开放："
-        echo "  ufw allow 8443/udp"
-      fi
-    else
-      echo "防火墙未启用"
-    fi
-  elif command -v firewall-cmd >/dev/null 2>&1; then
-    firewall-cmd --list-ports
-  else
-    echo "未检测到防火墙"
-  fi
-  echo
-  
-  # 5. 检查日志错误
-  log "5. 查看最近的错误日志..."
-  journalctl -u sing-box -n 20 --no-pager | grep -i "error\|fatal\|fail" || echo "未发现明显错误"
-  echo
-  
-  # 6. 测试域名连通性
-  log "6. 测试 Reality 伪装域名连通性..."
-  if [ -f /etc/sing-box/config.json ]; then
-    local domain=$(grep -o '"server_name": *"[^"]*"' /etc/sing-box/config.json | head -n1 | cut -d'"' -f4)
-    if [ -n "$domain" ]; then
-      echo "测试域名: $domain"
-      if timeout 3 openssl s_client -connect "$domain:443" -servername "$domain" </dev/null 2>&1 | grep -q "Verify return code: 0"; then
-        echo "✅ 域名 $domain 可正常访问"
-      else
-        warn "⚠️  域名 $domain 连接有问题"
-      fi
-    fi
-  fi
-  echo
-  
-  # 7. 提供建议
-  echo "========================================"
-  log "💡 常见问题解决方案："
-  echo "========================================"
-  echo
-  echo "问题1：连接被重置"
-  echo "  → 检查客户端配置是否正确（IP、端口、UUID）"
-  echo "  → 检查服务器防火墙是否开放端口"
-  echo "  → 检查 VPS 提供商的安全组/防火墙规则"
-  echo
-  echo "问题2：无法连接"
-  echo "  → ping 服务器 IP 是否通"
-  echo "  → 检查端口是否被 VPS 提供商封禁"
-  echo "  → 尝试更换端口（避免使用 80、443、8080 等常见端口）"
-  echo
-  echo "问题3：可以 ping 通但连不上"
-  echo "  → ICMP 和 TCP/UDP 是不同的协议"
-  echo "  → 用 telnet 或 nc 测试具体端口"
-  echo "  → 检查 Reality 域名是否被墙"
-  echo
-  echo "问题4：配置正确但还是连不上"
-  echo "  → 重启 sing-box 服务：systemctl restart sing-box"
-  echo "  → 查看实时日志：journalctl -u sing-box -f"
-  echo "  → 尝试更换 Reality 伪装域名"
-  echo
-  echo "========================================"
-  echo
-  read -rp "是否查看实时日志？(y/n): " view_logs
-  if [[ "$view_logs" =~ ^[Yy]$ ]]; then
-    log "显示实时日志（按 Ctrl+C 退出）..."
-    sleep 1
-    journalctl -u sing-box -f
-  fi
-}
-
-uninstall_singbox() {
-  log "开始卸载 sing-box..."
-  
-  # 停止并禁用服务
-  systemctl stop sing-box 2>/dev/null || true
-  systemctl disable sing-box 2>/dev/null || true
-  
-  # 删除服务文件
-  rm -f /etc/systemd/system/sing-box.service
-  systemctl daemon-reload
-  
-  # 备份配置
-  if [ -d /etc/sing-box ]; then
-    local backup_name="/root/sing-box-final-backup-$(date +%Y%m%d-%H%M%S).tar.gz"
-    tar -czf "$backup_name" /etc/sing-box/ 2>/dev/null || true
-    log "配置已备份到: $backup_name"
-  fi
-  
-  # 删除文件
-  rm -rf /etc/sing-box
-  rm -f /usr/local/bin/sing-box
-  rm -rf /tmp/sb-reality
-  rm -f /tmp/sing-box-config-*.json 2>/dev/null || true
-  
-  log "✅ sing-box 已完全卸载！"
-  log "配置备份保存在 /root/ 目录下"
-}
-
-show_current_config() {
-  if [ ! -f /etc/sing-box/config.json ]; then
-    warn "未找到配置文件 /etc/sing-box/config.json"
-    return
-  fi
-  
-  echo "========================================"
-  echo "当前配置信息："
-  echo "========================================"
-  
-  if [ -f /etc/sing-box/share-links.txt ]; then
-    cat /etc/sing-box/share-links.txt
-  else
-    warn "未找到分享链接文件"
-  fi
-  
-  echo
-  echo "服务状态："
-  systemctl status sing-box --no-pager -l | head -n 10
-  echo "========================================"
-}
-
 ############## 安装基础依赖 ##############
 
 install_base() {
@@ -509,7 +234,6 @@ write_config() {
   "dns": {
     "servers": [
       {
-        "tag": "cloudflare",
         "address": "tls://1.1.1.1"
       }
     ]
@@ -706,18 +430,11 @@ EOF
 
   if command -v qrencode >/dev/null 2>&1; then
     echo
-    log "生成二维码（终端显示）..."
-    echo
-    echo "【VLESS-REALITY 二维码】"
-    echo "$VLESS_URL" | qrencode -t ANSIUTF8
-    echo
-    echo "【TUIC-REALITY 二维码】"
-    echo "$TUIC_URL" | qrencode -t ANSIUTF8
-    echo
-    log "也可生成 PNG 文件："
+    log "生成二维码 PNG（保存在 /etc/sing-box/）..."
     echo "$VLESS_URL" | qrencode -o /etc/sing-box/vless.png
     echo "$TUIC_URL"  | qrencode -o /etc/sing-box/tuic.png
-    log "PNG 文件保存在：/etc/sing-box/vless.png, /etc/sing-box/tuic.png"
+    log "二维码文件：/etc/sing-box/vless.png, /etc/sing-box/tuic.png"
+    log "可用 FinalShell / SFTP 下载到本地，用手机扫码导入。"
   else
     warn "未安装 qrencode，已跳过二维码生成。"
   fi
@@ -725,34 +442,7 @@ EOF
 
 ############## 主流程 ##############
 
-setup_firewall() {
-  log "配置防火墙规则..."
-  
-  if command -v ufw >/dev/null 2>&1; then
-    # 允许 SSH（当前连接的端口）
-    ufw allow 22/tcp 2>/dev/null || true
-    
-    # 允许 VPN 端口
-    ufw allow "$1"/tcp  # VLESS
-    ufw allow "$2"/udp  # TUIC
-    
-    # 启用防火墙（如果未启用）
-    echo "y" | ufw enable 2>/dev/null || true
-    ufw status
-    
-    log "✅ 防火墙已配置"
-  elif command -v firewall-cmd >/dev/null 2>&1; then
-    # CentOS/RHEL 使用 firewalld
-    firewall-cmd --permanent --add-port="$1"/tcp
-    firewall-cmd --permanent --add-port="$2"/udp
-    firewall-cmd --reload
-    log "✅ 防火墙已配置"
-  else
-    warn "未检测到 ufw 或 firewalld，请手动配置防火墙开放端口 $1(TCP) 和 $2(UDP)"
-  fi
-}
-
-do_install() {
+main() {
   need_cmd curl
   need_cmd wget
   need_cmd jq
@@ -776,85 +466,15 @@ do_install() {
   TUIC_PASS=$(generate_uuid)
 
   write_config "$VLESS_PORT" "$TUIC_PORT" "$VLESS_UUID" "$TUIC_UUID" "$TUIC_PASS"
-  setup_firewall "$VLESS_PORT" "$TUIC_PORT"
   setup_systemd
   gen_share_links "$VLESS_PORT" "$TUIC_PORT" "$VLESS_UUID" "$TUIC_UUID" "$TUIC_PASS"
 
   echo
   log "🎉 全部完成！"
-  echo
-  echo "============== 🔐 安全建议 =============="
-  echo "1. 定期更新系统：apt update && apt upgrade"
-  echo "2. 修改 SSH 端口并禁用密码登录（只用密钥）"
-  echo "3. 定期检查流量使用：可用 vnstat 监控"
-  echo "4. 不要分享链接给不信任的人"
-  echo "5. 定期更改 UUID：重新运行本脚本即可"
-  echo "6. 监控服务状态：systemctl status sing-box"
-  echo "========================================"
-  echo
-  echo "============== 📱 客户端导入 =============="
-  echo "1）安卓 NekoBox / v2rayNG：扫码或粘贴链接"
-  echo "2）iOS Shadowrocket：扫码导入"
-  echo "3）Mac/Win sing-box / v2rayN：新建节点粘贴链接"
-  echo "4）二维码已在上方显示，也可在 /etc/sing-box/ 下载 PNG"
-  echo "=========================================="
-}
-
-main() {
-  # 显示菜单
-  while true; do
-    show_menu
-    read -rp "请选择操作 [0-5]: " choice
-    
-    case "$choice" in
-      1)
-        log "开始全新安装..."
-        do_install
-        break
-        ;;
-      2)
-        clean_old_install
-        log "开始重新安装..."
-        do_install
-        break
-        ;;
-      3)
-        clean_old_install
-        log "清理完成！"
-        break
-        ;;
-      4)
-        uninstall_singbox
-        break
-        ;;
-      5)
-        show_current_config
-        echo
-        read -rp "按回车键继续..."
-        ;;
-      6)
-        diagnose_connection
-        echo
-        read -rp "按回车键继续..."
-        ;;
-      7)
-        deep_clean
-        read -rp "是否立即重新安装？(y/n): " reinstall
-        if [[ "$reinstall" =~ ^[Yy]$ ]]; then
-          do_install
-        fi
-        break
-        ;;
-      0)
-        log "退出脚本"
-        exit 0
-        ;;
-      *)
-        err "无效选择，请重新输入 [0-7]"
-        echo
-        ;;
-    esac
-  done
+  echo "提示："
+  echo "1）安卓 NekoBox / v2rayNG：直接导入 vless:// 或 tuic:// 链接即可；"
+  echo "2）Mac Surge / sing-box / Nekoray：新建节点 → 粘贴链接导入；"
+  echo "3）二维码 PNG 在 /etc/sing-box/ 下，可扫码快速导入。"
 }
 
 main "$@"
