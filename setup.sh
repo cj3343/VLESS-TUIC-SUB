@@ -239,9 +239,8 @@ write_config() {
   "dns": {
     "servers": [
       {
-        "tag": "google",
-        "address": "https://dns.google/dns-query",
-        "address_resolver": "local"
+        "tag": "cloudflare",
+        "address": "https://1.1.1.1/dns-query"
       },
       {
         "tag": "local",
@@ -249,7 +248,6 @@ write_config() {
         "detour": "direct"
       }
     ],
-    "rules": [],
     "strategy": "ipv4_only"
   },
   "inbounds": [
@@ -471,4 +469,4 @@ main() {
   echo "3）二维码 PNG 在 /etc/sing-box/ 下，可扫码快速导入。"
 }
 
-main
+main "$@"
