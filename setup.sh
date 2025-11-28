@@ -164,27 +164,39 @@ SHORT_ID=$(openssl rand -hex 8)
 
 echo "👉 生成 Reality 密钥对 ..."
 
-# 调用 sing-box 生成密钥对（有的版本是 JSON，有的是纯文本）
+# 调用 sing-box 生成密钥对（可能是 JSON，也可能是纯文本）
 KEY_RAW=$(sing-box generate reality-keypair 2>/dev/null)
 
-# 兼容两种输出：
-# 1）JSON: {"private_key":"xxx","public_key":"yyy"}
-# 2）纯文本:
-#    PrivateKey: xxx
-#    PublicKey: yyy
-if echo "$KEY_RAW" | grep -q "{"; then
-  # JSON 格式
-  REALITY_PRIVATE_KEY=$(echo "$KEY_RAW" | jq -r '.private_key')
-  REALITY_PUBLIC_KEY=$(echo "$KEY_RAW" | jq -r '.public_key')
-else
-  # 纯文本格式
-  REALITY_PRIVATE_KEY=$(echo "$KEY_RAW" | sed -n 's/^PrivateKey:[[:space:]]*//p')
-  REALITY_PUBLIC_KEY=$(echo "$KEY_RAW" | sed -n 's/^PublicKey:[[:space:]]*//p')
+# 先尝试纯文本格式:
+#   PrivateKey: xxxxx
+#   PublicKey:  yyyyy
+REALITY_PRIVATE_KEY=$(printf '%s\n' "$KEY_RAW" \
+  | grep -i 'PrivateKey' \
+  | head -n1 \
+  | sed 's/.*:[[:space:]]*//')
+
+REALITY_PUBLIC_KEY=$(printf '%s\n' "$KEY_RAW" \
+  | grep -i 'PublicKey' \
+  | head -n1 \
+  | sed 's/.*:[[:space:]]*//')
+
+# 如果上面没抓到（说明是 JSON 格式），再按 JSON 格式匹配
+if [ -z "$REALITY_PRIVATE_KEY" ] || [ -z "$REALITY_PUBLIC_KEY" ]; then
+  REALITY_PRIVATE_KEY=$(printf '%s\n' "$KEY_RAW" \
+    | sed -n 's/.*"private_key"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+    | head -n1)
+  REALITY_PUBLIC_KEY=$(printf '%s\n' "$KEY_RAW" \
+    | sed -n 's/.*"public_key"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+    | head -n1)
 fi
 
-# 简单校验一下，防止为空
+# 最终校验
 if [ -z "$REALITY_PRIVATE_KEY" ] || [ -z "$REALITY_PUBLIC_KEY" ]; then
-  echo "❌ 生成 Reality 密钥对失败，请检查 sing-box 版本或手动执行：sing-box generate reality-keypair"
+  echo "❌ 生成 Reality 密钥对失败，输出内容如下："
+  echo "----------------------------------------"
+  echo "$KEY_RAW"
+  echo "----------------------------------------"
+  echo "请在 VPS 上手动执行：sing-box generate reality-keypair"
   exit 1
 fi
 
