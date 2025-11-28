@@ -70,8 +70,52 @@ show_menu() {
   echo "4. 卸载 sing-box"
   echo "5. 查看当前配置"
   echo "6. 诊断连接问题"
+  echo "7. 🔥 彻底清理并重装（完全重置）"
   echo "0. 退出"
   echo "========================================"
+  echo
+}
+
+deep_clean() {
+  warn "⚠️  此操作将："
+  echo "  - 停止并删除 sing-box 服务"
+  echo "  - 删除所有配置文件（包括备份）"
+  echo "  - 删除 sing-box 程序"
+  echo "  - 清理所有临时文件"
+  echo
+  read -rp "确认执行彻底清理？(yes/no): " confirm
+  
+  if [ "$confirm" != "yes" ]; then
+    log "已取消"
+    return
+  fi
+  
+  log "开始彻底清理..."
+  
+  # 停止服务
+  systemctl stop sing-box 2>/dev/null || true
+  systemctl disable sing-box 2>/dev/null || true
+  
+  # 删除服务文件
+  rm -f /etc/systemd/system/sing-box.service
+  systemctl daemon-reload
+  
+  # 删除程序
+  rm -f /usr/local/bin/sing-box
+  
+  # 完全删除配置目录（不备份）
+  rm -rf /etc/sing-box
+  
+  # 清理临时文件
+  rm -rf /tmp/sb-reality
+  rm -f /tmp/sing-box-config-*.json 2>/dev/null || true
+  rm -f /tmp/sb.tar.gz 2>/dev/null || true
+  
+  # 清理旧备份
+  rm -f /root/sing-box-backup-*.tar.gz 2>/dev/null || true
+  rm -f /root/sing-box-final-backup-*.tar.gz 2>/dev/null || true
+  
+  log "✅ 彻底清理完成！系统已恢复到初始状态"
   echo
 }
 
@@ -793,12 +837,20 @@ main() {
         echo
         read -rp "按回车键继续..."
         ;;
+      7)
+        deep_clean
+        read -rp "是否立即重新安装？(y/n): " reinstall
+        if [[ "$reinstall" =~ ^[Yy]$ ]]; then
+          do_install
+        fi
+        break
+        ;;
       0)
         log "退出脚本"
         exit 0
         ;;
       *)
-        err "无效选择，请重新输入 [0-6]"
+        err "无效选择，请重新输入 [0-7]"
         echo
         ;;
     esac
