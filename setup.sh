@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# VLESS-REALITY + TUIC 一键安装脚本（修复版 v3）
+# VLESS-REALITY + TUIC 一键安装脚本（安全版 v2）
 
 set -uo pipefail
 
@@ -48,7 +48,7 @@ install_sing_box() {
 
   log "检测并安装最新 sing-box ..."
 
-  # 用 GitHub API 获取最新 tag
+  # 用 GitHub API 获取最新 tag，例如 v1.14.3
   local LATEST_TAG
   LATEST_TAG=$(curl -fsSL "https://api.github.com/repos/SagerNet/sing-box/releases/latest" | jq -r '.tag_name')
   if [ -z "$LATEST_TAG" ] || [ "$LATEST_TAG" = "null" ]; then
@@ -56,6 +56,8 @@ install_sing_box() {
     exit 1
   fi
 
+  # 目录用 tag（带 v），文件名用去掉 v 的版本号
+  # 如：tag = v1.14.3 → VER = 1.14.3
   local VER
   VER="${LATEST_TAG#v}"
 
@@ -65,6 +67,7 @@ install_sing_box() {
   wget -O sb.tar.gz "$SB_URL"
   tar -xzf sb.tar.gz
 
+  # 解压出来的目录名类似 sing-box-1.14.3-linux-amd64
   local SB_DIR
   SB_DIR=$(tar -tzf sb.tar.gz | head -n 1 | cut -d/ -f1)
   install -m 755 "${SB_DIR}/sing-box" /usr/local/bin/sing-box
@@ -76,6 +79,7 @@ install_sing_box() {
 
 ############## Reality 域名测试与选择 ##############
 
+# 你的域名池（Gist）
 GIST_URL="https://gist.githubusercontent.com/cj3343/8d38d603440ea50105319d7c09909faf/raw/47e05fcfdece890d1480f462afadc0baffcbb120/domain-list.txt"
 
 download_domain_list() {
@@ -113,6 +117,7 @@ test_domains_latency() {
   local best_domain=""
   local best_ms=999999
 
+  # 随机抽 12 个域名测试
   while read -r d; do
     [ -z "$d" ] && continue
     local t1 t2 cost
@@ -136,6 +141,7 @@ test_domains_latency() {
     log "✅ 当前测速最优域名：$best_domain (${best_ms} ms)"
   fi
 
+  # 向上层返回：best_domain, best_ms
   REALITY_BEST_DOMAIN="$best_domain"
   REALITY_BEST_MS="$best_ms"
 }
@@ -191,6 +197,7 @@ generate_reality_keys() {
     exit 1
   fi
 
+  # 生成 short_id（16位 hex）
   SHORT_ID=$(tr -dc 'a-f0-9' </dev/urandom | head -c 16)
 
   log "Reality 私钥: $REALITY_PRIVATE"
@@ -206,7 +213,7 @@ generate_uuid() {
   fi
 }
 
-############## 写入 sing-box 配置（完全重写，符合最新格式）##############
+############## 写入 sing-box 配置 ##############
 
 write_config() {
   local VLESS_PORT="$1"
@@ -219,13 +226,10 @@ write_config() {
 
   if [ -f /etc/sing-box/config.json ]; then
     cp /etc/sing-box/config.json "/etc/sing-box/config.json.bak-$(date +%s)"
-    warn "已备份旧 config.json"
+    warn "已备份旧 config.json 为 config.json.bak-时间戳"
   fi
 
-  # 先写入临时文件
-  local TMP_CONFIG="/tmp/sing-box-config-$$.json"
-  
-  cat > "$TMP_CONFIG" <<'EOFCONFIG'
+  cat > /etc/sing-box/config.json <<EOF
 {
   "log": {
     "level": "info",
@@ -234,7 +238,14 @@ write_config() {
   "dns": {
     "servers": [
       {
-        "address": "tls://1.1.1.1"
+        "tag": "google",
+        "address": "https://dns.google/dns-query",
+        "strategy": "ipv4_only"
+      },
+      {
+        "tag": "local",
+        "address": "local",
+        "detour": "direct"
       }
     ]
   },
@@ -243,24 +254,21 @@ write_config() {
       "type": "vless",
       "tag": "vless-reality",
       "listen": "::",
-      "listen_port": VLESS_PORT_PLACEHOLDER,
+      "listen_port": ${VLESS_PORT},
       "users": [
         {
-          "uuid": "VLESS_UUID_PLACEHOLDER",
+          "uuid": "${VLESS_UUID}",
           "flow": "xtls-rprx-vision"
         }
       ],
       "tls": {
         "enabled": true,
-        "server_name": "REALITY_DOMAIN_PLACEHOLDER",
+        "server_name": "${REALITY_DOMAIN}",
         "reality": {
           "enabled": true,
-          "handshake": {
-            "server": "REALITY_DOMAIN_PLACEHOLDER",
-            "server_port": 443
-          },
-          "private_key": "REALITY_PRIVATE_PLACEHOLDER",
-          "short_id": ["SHORT_ID_PLACEHOLDER"]
+          "handshake": "${REALITY_DOMAIN}",
+          "private_key": "${REALITY_PRIVATE}",
+          "short_id": ["${SHORT_ID}"]
         }
       }
     },
@@ -268,25 +276,22 @@ write_config() {
       "type": "tuic",
       "tag": "tuic",
       "listen": "::",
-      "listen_port": TUIC_PORT_PLACEHOLDER,
+      "listen_port": ${TUIC_PORT},
       "users": [
         {
-          "uuid": "TUIC_UUID_PLACEHOLDER",
-          "password": "TUIC_PASS_PLACEHOLDER"
+          "uuid": "${TUIC_UUID}",
+          "password": "${TUIC_PASS}"
         }
       ],
       "congestion_control": "bbr",
       "tls": {
         "enabled": true,
-        "server_name": "REALITY_DOMAIN_PLACEHOLDER",
+        "server_name": "${REALITY_DOMAIN}",
         "reality": {
           "enabled": true,
-          "handshake": {
-            "server": "REALITY_DOMAIN_PLACEHOLDER",
-            "server_port": 443
-          },
-          "private_key": "REALITY_PRIVATE_PLACEHOLDER",
-          "short_id": ["SHORT_ID_PLACEHOLDER"]
+          "handshake": "${REALITY_DOMAIN}",
+          "private_key": "${REALITY_PRIVATE}",
+          "short_id": ["${SHORT_ID}"]
         }
       }
     }
@@ -312,33 +317,14 @@ write_config() {
     "final": "direct"
   }
 }
-EOFCONFIG
+EOF
 
-  # 替换占位符
-  sed -i "s/VLESS_PORT_PLACEHOLDER/${VLESS_PORT}/g" "$TMP_CONFIG"
-  sed -i "s/TUIC_PORT_PLACEHOLDER/${TUIC_PORT}/g" "$TMP_CONFIG"
-  sed -i "s/VLESS_UUID_PLACEHOLDER/${VLESS_UUID}/g" "$TMP_CONFIG"
-  sed -i "s/TUIC_UUID_PLACEHOLDER/${TUIC_UUID}/g" "$TMP_CONFIG"
-  sed -i "s/TUIC_PASS_PLACEHOLDER/${TUIC_PASS}/g" "$TMP_CONFIG"
-  sed -i "s/REALITY_DOMAIN_PLACEHOLDER/${REALITY_DOMAIN}/g" "$TMP_CONFIG"
-  sed -i "s|REALITY_PRIVATE_PLACEHOLDER|${REALITY_PRIVATE}|g" "$TMP_CONFIG"
-  sed -i "s/SHORT_ID_PLACEHOLDER/${SHORT_ID}/g" "$TMP_CONFIG"
-
-  log "配置已生成到临时文件: $TMP_CONFIG"
-  log "开始检查 JSON 合法性..."
-  
-  if ! sing-box check -c "$TMP_CONFIG"; then
-    err "配置检查失败！"
-    err "临时配置文件保存在: $TMP_CONFIG"
-    err "请检查后手动复制到 /etc/sing-box/config.json"
+  log "配置写入完成，开始检查 JSON 合法性..."
+  if ! sing-box check -c /etc/sing-box/config.json; then
+    err "配置检查失败，请手动修复 /etc/sing-box/config.json 后重试。"
     exit 1
   fi
-  
   log "配置合法 ✅"
-  
-  # 移动到正式位置
-  mv "$TMP_CONFIG" /etc/sing-box/config.json
-  log "配置已保存到 /etc/sing-box/config.json"
 }
 
 ############## systemd 服务 ##############
@@ -365,8 +351,7 @@ EOF
   systemctl enable sing-box >/dev/null 2>&1 || true
   systemctl restart sing-box
 
-  sleep 2
-  log "Sing-box 服务状态："
+  sleep 1
   systemctl --no-pager -l status sing-box | sed -n '1,15p'
 }
 
