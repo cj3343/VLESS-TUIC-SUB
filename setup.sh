@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# VLESS-REALITY + TUIC 一键安装脚本（安全版 v2）
+# VLESS-REALITY + TUIC 一键安装脚本（修复版）
 
 set -uo pipefail
 
@@ -213,7 +213,7 @@ generate_uuid() {
   fi
 }
 
-############## 写入 sing-box 配置 ##############
+############## 写入 sing-box 配置（修复版）##############
 
 write_config() {
   local VLESS_PORT="$1"
@@ -229,6 +229,7 @@ write_config() {
     warn "已备份旧 config.json 为 config.json.bak-时间戳"
   fi
 
+  # 修复：使用新版 DNS 格式和正确的 Reality handshake 格式
   cat > /etc/sing-box/config.json <<EOF
 {
   "log": {
@@ -240,14 +241,16 @@ write_config() {
       {
         "tag": "google",
         "address": "https://dns.google/dns-query",
-        "strategy": "ipv4_only"
+        "address_resolver": "local"
       },
       {
         "tag": "local",
         "address": "local",
         "detour": "direct"
       }
-    ]
+    ],
+    "rules": [],
+    "strategy": "ipv4_only"
   },
   "inbounds": [
     {
@@ -266,7 +269,10 @@ write_config() {
         "server_name": "${REALITY_DOMAIN}",
         "reality": {
           "enabled": true,
-          "handshake": "${REALITY_DOMAIN}",
+          "handshake": {
+            "server": "${REALITY_DOMAIN}",
+            "server_port": 443
+          },
           "private_key": "${REALITY_PRIVATE}",
           "short_id": ["${SHORT_ID}"]
         }
@@ -289,7 +295,10 @@ write_config() {
         "server_name": "${REALITY_DOMAIN}",
         "reality": {
           "enabled": true,
-          "handshake": "${REALITY_DOMAIN}",
+          "handshake": {
+            "server": "${REALITY_DOMAIN}",
+            "server_port": 443
+          },
           "private_key": "${REALITY_PRIVATE}",
           "short_id": ["${SHORT_ID}"]
         }
@@ -351,7 +360,7 @@ EOF
   systemctl enable sing-box >/dev/null 2>&1 || true
   systemctl restart sing-box
 
-  sleep 1
+  sleep 2
   systemctl --no-pager -l status sing-box | sed -n '1,15p'
 }
 
@@ -462,4 +471,4 @@ main() {
   echo "3）二维码 PNG 在 /etc/sing-box/ 下，可扫码快速导入。"
 }
 
-main "$@"
+main
