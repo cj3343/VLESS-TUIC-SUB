@@ -71,6 +71,9 @@ show_menu() {
   echo "5. 查看当前配置"
   echo "6. 诊断连接问题"
   echo "7. 🔥 彻底清理并重装（完全重置）"
+  echo "8. 查询 Reality 域名"
+  echo "9. 修改 Reality 域名"
+  echo "10. 综合检查（安装完整性）"
   echo "0. 退出"
   echo "========================================"
   echo
@@ -297,15 +300,124 @@ install_base() {
   if command -v apt-get >/dev/null 2>&1; then
     log "检测到 Debian/Ubuntu 系统，安装依赖..."
     apt-get update -y
-    apt-get install -y curl wget jq openssl qrencode
+    apt-get install -y curl wget jq openssl qrencode sudo chrony
+    systemctl enable chrony --now >/dev/null 2>&1 || true
   elif command -v yum >/dev/null 2>&1; then
     log "检测到 CentOS/RHEL 系统，安装依赖..."
     yum install -y epel-release
-    yum install -y curl wget jq openssl qrencode
+    yum install -y curl wget jq openssl qrencode sudo chrony
+    systemctl enable chronyd --now >/dev/null 2>&1 || true
   else
     err "无法识别的系统（非 apt / yum），请手动安装 curl、wget、jq、openssl。"
     exit 1
   fi
+}
+
+############## 安装前检查与优化 ##############
+
+check_prereqs() {
+  local missing=0
+  for cmd in jq curl wget sudo; do
+    if ! command -v "$cmd" >/dev/null 2>&1; then
+      warn "缺少命令: $cmd"
+      missing=1
+    fi
+  done
+
+  if systemctl is-active --quiet chrony 2>/dev/null; then
+    log "chrony 服务已运行"
+  elif systemctl is-active --quiet chronyd 2>/dev/null; then
+    log "chronyd 服务已运行"
+  else
+    warn "chrony/chronyd 未运行"
+  fi
+
+  if [ "$missing" -eq 1 ]; then
+    warn "前置依赖未完整安装，建议重新运行依赖安装步骤"
+  else
+    log "前置依赖检查通过"
+  fi
+
+  log "当前系统时间：$(date)"
+}
+
+enable_bbr() {
+  if ! sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null | grep -q "bbr"; then
+    log "尝试启用 BBR 加速..."
+    modprobe tcp_bbr >/dev/null 2>&1 || true
+    cat > /etc/sysctl.d/99-bbr.conf <<'EOF'
+net.core.default_qdisc=fq
+net.ipv4.tcp_congestion_control=bbr
+EOF
+    sysctl --system >/dev/null 2>&1 || true
+  fi
+
+  if sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null | grep -q "bbr"; then
+    log "✅ BBR 已启用"
+  else
+    warn "⚠️  BBR 未启用（可能内核不支持）"
+  fi
+}
+
+############## 综合检查 ##############
+
+full_health_check() {
+  echo "========================================"
+  echo "🧪 综合检查（安装完整性）"
+  echo "========================================"
+
+  check_prereqs
+
+  if command -v sing-box >/dev/null 2>&1; then
+    log "sing-box 版本：$(sing-box version 2>/dev/null || echo '未知')"
+  else
+    warn "未找到 sing-box 可执行文件"
+  fi
+
+  if [ -f /etc/sing-box/config.json ]; then
+    log "配置文件存在：/etc/sing-box/config.json"
+    if sing-box check -c /etc/sing-box/config.json >/dev/null 2>&1; then
+      log "配置检查通过"
+    else
+      err "配置检查失败"
+    fi
+  else
+    warn "未找到配置文件 /etc/sing-box/config.json"
+  fi
+
+  if command -v jq >/dev/null 2>&1 && [ -f /etc/sing-box/config.json ]; then
+    local vless_port tuic_port reality_domain
+    vless_port=$(jq -r '.inbounds[] | select(.type=="vless" and .tag=="vless-reality") | .listen_port' /etc/sing-box/config.json 2>/dev/null | head -n 1)
+    tuic_port=$(jq -r '.inbounds[] | select(.type=="tuic" and .tag=="tuic") | .listen_port' /etc/sing-box/config.json 2>/dev/null | head -n 1)
+    reality_domain=$(jq -r '.inbounds[] | select(.type=="vless" and .tag=="vless-reality") | .tls.server_name' /etc/sing-box/config.json 2>/dev/null | head -n 1)
+    [ -n "$vless_port" ] && log "VLESS 端口: $vless_port"
+    [ -n "$tuic_port" ] && log "TUIC  端口: $tuic_port"
+    [ -n "$reality_domain" ] && log "Reality 域名: $reality_domain"
+
+    if command -v ss >/dev/null 2>&1; then
+      [ -n "$vless_port" ] && ss -tulnp | grep -q ":${vless_port} " && log "VLESS 端口监听正常" || warn "VLESS 端口未监听"
+      [ -n "$tuic_port" ] && ss -tulnp | grep -q ":${tuic_port} " && log "TUIC  端口监听正常" || warn "TUIC  端口未监听"
+    elif command -v netstat >/dev/null 2>&1; then
+      [ -n "$vless_port" ] && netstat -tulnp | grep -q ":${vless_port} " && log "VLESS 端口监听正常" || warn "VLESS 端口未监听"
+      [ -n "$tuic_port" ] && netstat -tulnp | grep -q ":${tuic_port} " && log "TUIC  端口监听正常" || warn "TUIC  端口未监听"
+    else
+      warn "未找到 ss/netstat，跳过端口监听检查"
+    fi
+  fi
+
+  if systemctl is-active --quiet sing-box 2>/dev/null; then
+    log "sing-box 服务运行中"
+  else
+    warn "sing-box 服务未运行"
+  fi
+
+  if sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null | grep -q "bbr"; then
+    log "BBR 已启用"
+  else
+    warn "BBR 未启用"
+  fi
+
+  echo "========================================"
 }
 
 ############## 安装最新 sing-box ##############
@@ -447,6 +559,105 @@ choose_reality_domain() {
   done
 
   log "✅ 最终使用的 Reality 伪装域名：$REALITY_DOMAIN"
+}
+
+get_current_reality_domain() {
+  if ! command -v jq >/dev/null 2>&1; then
+    return
+  fi
+  jq -r '.inbounds[] | select(.type=="vless" and .tag=="vless-reality") | .tls.server_name' /etc/sing-box/config.json 2>/dev/null | head -n 1
+}
+
+query_reality_domain() {
+  if [ ! -f /etc/sing-box/config.json ]; then
+    warn "未找到配置文件 /etc/sing-box/config.json"
+    return
+  fi
+  if ! command -v jq >/dev/null 2>&1; then
+    err "缺少命令: jq"
+    return
+  fi
+
+  local server_name handshake_name link_sni
+  server_name=$(get_current_reality_domain)
+  handshake_name=$(jq -r '.inbounds[] | select(.type=="vless" and .tag=="vless-reality") | .tls.reality.handshake.server' /etc/sing-box/config.json 2>/dev/null | head -n 1)
+
+  echo "========================================"
+  echo "Reality 域名信息："
+  echo "========================================"
+  echo "server_name: ${server_name:-未找到}"
+  echo "handshake.server: ${handshake_name:-未找到}"
+
+  if [ -f /etc/sing-box/share-links.txt ]; then
+    link_sni=$(grep -o 'sni=[^&]*' /etc/sing-box/share-links.txt | head -n 1 | cut -d= -f2)
+    if [ -n "$link_sni" ]; then
+      echo "分享链接 sni: $link_sni"
+    fi
+  fi
+  echo "========================================"
+}
+
+update_share_links_reality() {
+  local new_domain="$1"
+  if [ ! -f /etc/sing-box/share-links.txt ]; then
+    warn "未找到分享链接文件 /etc/sing-box/share-links.txt，已跳过更新"
+    return
+  fi
+
+  local tmp="/tmp/sing-box-share-links-$$.txt"
+  sed -E "s/(sni=)[^& ]+/\\1${new_domain}/g" /etc/sing-box/share-links.txt > "$tmp"
+  mv "$tmp" /etc/sing-box/share-links.txt
+  log "分享链接已更新 sni 参数"
+}
+
+update_reality_domain() {
+  if [ ! -f /etc/sing-box/config.json ]; then
+    warn "未找到配置文件 /etc/sing-box/config.json"
+    return
+  fi
+  if ! command -v jq >/dev/null 2>&1; then
+    err "缺少命令: jq"
+    return
+  fi
+
+  local current_domain
+  current_domain=$(get_current_reality_domain)
+  log "当前 Reality 域名：${current_domain:-未知}"
+  echo
+  read -rp "是否自动测速选择新域名？(y/n): " auto_pick
+  if [[ "$auto_pick" =~ ^[Yy]$ ]]; then
+    choose_reality_domain
+  else
+    read -rp "输入新的 Reality 域名：" REALITY_DOMAIN
+  fi
+
+  if [ -z "${REALITY_DOMAIN:-}" ]; then
+    warn "未输入有效域名，已取消修改"
+    return
+  fi
+
+  local tmp="/tmp/sing-box-config-reality-$$.json"
+  if ! jq --arg domain "$REALITY_DOMAIN" \
+    '(.inbounds[] | select(.type=="vless" and .tag=="vless-reality") | .tls.server_name) = $domain
+     | (.inbounds[] | select(.type=="vless" and .tag=="vless-reality") | .tls.reality.handshake.server) = $domain' \
+    /etc/sing-box/config.json > "$tmp"; then
+    err "更新配置失败，请检查配置文件格式"
+    rm -f "$tmp"
+    return
+  fi
+
+  if ! sing-box check -c "$tmp"; then
+    err "配置检查失败，已保留临时文件: $tmp"
+    return
+  fi
+
+  cp /etc/sing-box/config.json "/etc/sing-box/config.json.bak-$(date +%s)"
+  mv "$tmp" /etc/sing-box/config.json
+  log "Reality 域名已更新为：$REALITY_DOMAIN"
+
+  update_share_links_reality "$REALITY_DOMAIN"
+  systemctl restart sing-box
+  log "sing-box 服务已重启"
 }
 
 ############## 生成 Reality 密钥 / UUID 等 ##############
@@ -775,11 +986,12 @@ setup_firewall() {
 }
 
 do_install() {
+  install_base
+  check_prereqs
+  enable_bbr
   need_cmd curl
   need_cmd wget
   need_cmd jq
-
-  install_base
   install_sing_box
   choose_reality_domain
   generate_reality_keys
@@ -827,7 +1039,7 @@ main() {
   # 显示菜单
   while true; do
     show_menu
-    read -rp "请选择操作 [0-5]: " choice
+    read -rp "请选择操作 [0-10]: " choice
     
     case "$choice" in
       1)
@@ -868,12 +1080,27 @@ main() {
         fi
         break
         ;;
+      8)
+        query_reality_domain
+        echo
+        read -rp "按回车键继续..."
+        ;;
+      9)
+        update_reality_domain
+        echo
+        read -rp "按回车键继续..."
+        ;;
+      10)
+        full_health_check
+        echo
+        read -rp "按回车键继续..."
+        ;;
       0)
         log "退出脚本"
         exit 0
         ;;
       *)
-        err "无效选择，请重新输入 [0-7]"
+        err "无效选择，请重新输入 [0-10]"
         echo
         ;;
     esac
