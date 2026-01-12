@@ -74,6 +74,7 @@ show_menu() {
   echo "8. 查询 Reality 域名"
   echo "9. 修改 Reality 域名"
   echo "10. 综合检查（安装完整性）"
+  echo "11. 重新加载节点信息和二维码"
   echo "0. 退出"
   echo "========================================"
   echo
@@ -418,6 +419,41 @@ full_health_check() {
   fi
 
   echo "========================================"
+}
+
+reload_share_links() {
+  if [ ! -f /etc/sing-box/config.json ]; then
+    warn "未找到配置文件 /etc/sing-box/config.json"
+    return
+  fi
+  if ! command -v jq >/dev/null 2>&1; then
+    err "缺少命令: jq"
+    return
+  fi
+
+  local vless_port vless_uuid tuic_port tuic_uuid tuic_pass
+  vless_port=$(jq -r '.inbounds[] | select(.type=="vless" and .tag=="vless-reality") | .listen_port' /etc/sing-box/config.json 2>/dev/null | head -n 1)
+  vless_uuid=$(jq -r '.inbounds[] | select(.type=="vless" and .tag=="vless-reality") | .users[0].uuid' /etc/sing-box/config.json 2>/dev/null | head -n 1)
+  tuic_port=$(jq -r '.inbounds[] | select(.type=="tuic" and .tag=="tuic") | .listen_port' /etc/sing-box/config.json 2>/dev/null | head -n 1)
+  tuic_uuid=$(jq -r '.inbounds[] | select(.type=="tuic" and .tag=="tuic") | .users[0].uuid' /etc/sing-box/config.json 2>/dev/null | head -n 1)
+  tuic_pass=$(jq -r '.inbounds[] | select(.type=="tuic" and .tag=="tuic") | .users[0].password' /etc/sing-box/config.json 2>/dev/null | head -n 1)
+  REALITY_DOMAIN=$(jq -r '.inbounds[] | select(.type=="vless" and .tag=="vless-reality") | .tls.server_name' /etc/sing-box/config.json 2>/dev/null | head -n 1)
+  SHORT_ID=$(jq -r '.inbounds[] | select(.type=="vless" and .tag=="vless-reality") | .tls.reality.short_id[0]' /etc/sing-box/config.json 2>/dev/null | head -n 1)
+
+  if [ -f /etc/sing-box/reality.txt ]; then
+    REALITY_PUBLIC=$(grep -i "PublicKey" /etc/sing-box/reality.txt | awk '{print $2}')
+  fi
+
+  if [ -z "${REALITY_PUBLIC:-}" ]; then
+    read -rp "未找到 Reality 公钥，请手动输入： " REALITY_PUBLIC
+  fi
+
+  if [ -z "$vless_port" ] || [ -z "$vless_uuid" ] || [ -z "$tuic_port" ] || [ -z "$tuic_uuid" ] || [ -z "$tuic_pass" ] || [ -z "$REALITY_DOMAIN" ] || [ -z "$REALITY_PUBLIC" ] || [ -z "$SHORT_ID" ]; then
+    err "读取配置不完整，无法重新生成节点信息"
+    return
+  fi
+
+  gen_share_links "$vless_port" "$tuic_port" "$vless_uuid" "$tuic_uuid" "$tuic_pass"
 }
 
 ############## 安装最新 sing-box ##############
@@ -1039,7 +1075,7 @@ main() {
   # 显示菜单
   while true; do
     show_menu
-    read -rp "请选择操作 [0-10]: " choice
+    read -rp "请选择操作 [0-11]: " choice
     
     case "$choice" in
       1)
@@ -1095,12 +1131,17 @@ main() {
         echo
         read -rp "按回车键继续..."
         ;;
+      11)
+        reload_share_links
+        echo
+        read -rp "按回车键继续..."
+        ;;
       0)
         log "退出脚本"
         exit 0
         ;;
       *)
-        err "无效选择，请重新输入 [0-10]"
+        err "无效选择，请重新输入 [0-11]"
         echo
         ;;
     esac
