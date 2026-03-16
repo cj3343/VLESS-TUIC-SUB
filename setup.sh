@@ -82,6 +82,7 @@ show_menu() {
   echo "13. 查看 Snell 配置"
   echo "14. 卸载 Snell"
   echo "15. 重启 Snell 服务"
+  echo "16. 重新生成 Snell 配置"
   echo ""
   echo "0. 退出"
   echo "========================================"
@@ -654,12 +655,12 @@ gen_snell_config() {
     return
   fi
 
-  # 获取国家代码
+  # 获取国家代码或使用服务器名称
   local COUNTRY
   COUNTRY=$(curl -s https://ipinfo.io/country 2>/dev/null || echo "VPS")
 
-  # 生成 Surge 格式配置
-  local SURGE_CONFIG="${COUNTRY} = snell, ${SERVER_IP}, ${PORT}, psk = ${PSK}, version = 4, reuse = true"
+  # 生成 Surge 格式配置（完整参数）
+  local SURGE_CONFIG="${COUNTRY} = snell, ${SERVER_IP}, ${PORT}, psk=${PSK}, version=4, tfo=true, reuse=true, ecn=true"
 
   # 保存配置
   cat > /etc/snell/config.txt <<EOF
@@ -670,18 +671,25 @@ gen_snell_config() {
 PSK: ${PSK}
 版本: 4
 
-=== Surge 配置 ===
+=== Surge 配置（直接复制使用）===
 ${SURGE_CONFIG}
 
-=== Shadowrocket / Surge 导入 ===
-1. 打开 Surge/Shadowrocket
-2. 添加代理 -> Snell
+=== 参数说明 ===
+- tfo=true: 启用 TCP Fast Open（提升连接速度）
+- reuse=true: 启用连接复用（减少延迟）
+- ecn=true: 启用 ECN（显式拥塞通知）
+
+=== Shadowrocket 手动配置 ===
+1. 打开 Shadowrocket
+2. 添加节点 -> 类型选择 Snell
 3. 填入以下信息：
-   - 服务器: ${SERVER_IP}
+   - 地址: ${SERVER_IP}
    - 端口: ${PORT}
    - PSK: ${PSK}
+   - 混淆: 无
    - 版本: 4
    - 复用: 开启
+   - TCP Fast Open: 开启
 EOF
 
   echo
@@ -690,6 +698,8 @@ EOF
   echo "=================================================="
   echo
   log "配置已保存到: /etc/snell/config.txt"
+  echo
+  log "💡 提示：直接复制上面的 Surge 配置行到 Surge 配置文件即可使用"
 }
 
 show_snell_config() {
@@ -746,6 +756,32 @@ restart_snell() {
   systemctl restart snell
   sleep 2
   systemctl status snell --no-pager -l | head -n 10
+}
+
+regenerate_snell_config() {
+  if [ ! -f /etc/snell/snell-server.conf ]; then
+    warn "未找到 Snell 配置文件，请先安装 Snell"
+    return
+  fi
+
+  log "读取当前配置..."
+
+  # 从配置文件读取端口和 PSK
+  local PORT PSK
+  PORT=$(grep -oP 'listen = [^:]+:\K\d+' /etc/snell/snell-server.conf 2>/dev/null)
+  PSK=$(grep -oP 'psk = \K.*' /etc/snell/snell-server.conf 2>/dev/null)
+
+  if [ -z "$PORT" ] || [ -z "$PSK" ]; then
+    err "无法读取配置信息"
+    return
+  fi
+
+  log "当前端口: $PORT"
+  log "当前 PSK: $PSK"
+  echo
+
+  # 重新生成配置
+  gen_snell_config "$PORT" "$PSK"
 }
 
 ############## 安装最新 sing-box ##############
@@ -1374,7 +1410,7 @@ main() {
   # 显示菜单
   while true; do
     show_menu
-    read -rp "请选择操作 [0-15]: " choice
+    read -rp "请选择操作 [0-16]: " choice
 
     case "$choice" in
       1)
@@ -1455,12 +1491,17 @@ main() {
         echo
         read -rp "按回车键继续..."
         ;;
+      16)
+        regenerate_snell_config
+        echo
+        read -rp "按回车键继续..."
+        ;;
       0)
         log "退出脚本"
         exit 0
         ;;
       *)
-        err "无效选择，请重新输入 [0-15]"
+        err "无效选择，请重新输入 [0-16]"
         echo
         ;;
     esac
