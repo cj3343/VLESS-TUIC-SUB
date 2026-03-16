@@ -83,6 +83,7 @@ show_menu() {
   echo "14. 卸载 Snell"
   echo "15. 重启 Snell 服务"
   echo "16. 重新生成 Snell 配置"
+  echo "17. 🔍 诊断 Snell 连接问题"
   echo ""
   echo "0. 退出"
   echo "========================================"
@@ -784,6 +785,145 @@ regenerate_snell_config() {
   gen_snell_config "$PORT" "$PSK"
 }
 
+diagnose_snell() {
+  echo "=========================================="
+  echo "🔍 Snell 节点诊断"
+  echo "=========================================="
+  echo
+
+  # 1. 检查服务状态
+  log "1. 检查服务状态..."
+  if systemctl is-active --quiet snell; then
+    echo "✅ 服务正在运行"
+    systemctl status snell --no-pager -l | head -n 10
+  else
+    err "❌ 服务未运行"
+    systemctl status snell --no-pager -l | head -n 15
+    return
+  fi
+  echo
+
+  # 2. 检查配置文件
+  log "2. 检查配置文件..."
+  if [ -f /etc/snell/snell-server.conf ]; then
+    echo "✅ 配置文件存在"
+    cat /etc/snell/snell-server.conf
+  else
+    err "❌ 配置文件不存在"
+    return
+  fi
+  echo
+
+  # 3. 检查端口监听
+  log "3. 检查端口监听..."
+  local PORT
+  PORT=$(grep -oP 'listen = [^:]+:\K\d+' /etc/snell/snell-server.conf 2>/dev/null)
+  if [ -n "$PORT" ]; then
+    echo "配置端口: $PORT"
+    if ss -tulnp 2>/dev/null | grep -q ":${PORT} " || netstat -tulnp 2>/dev/null | grep -q ":${PORT} "; then
+      echo "✅ 端口 $PORT 正在监听"
+      ss -tulnp 2>/dev/null | grep ":${PORT} " || netstat -tulnp 2>/dev/null | grep ":${PORT} "
+    else
+      err "❌ 端口 $PORT 未监听！"
+    fi
+  else
+    err "❌ 无法读取端口配置"
+  fi
+  echo
+
+  # 4. 检查防火墙
+  log "4. 检查防火墙..."
+  if command -v ufw >/dev/null 2>&1; then
+    if ufw status | grep -q "Status: active"; then
+      echo "防火墙状态："
+      ufw status | grep -E "$PORT|Status"
+      if ! ufw status | grep -q "$PORT"; then
+        warn "⚠️  端口 $PORT 未在防火墙中开放！"
+        echo "运行以下命令开放端口："
+        echo "  ufw allow $PORT/tcp"
+      fi
+    else
+      echo "防火墙未启用"
+    fi
+  elif command -v firewall-cmd >/dev/null 2>&1; then
+    echo "firewalld 开放端口："
+    firewall-cmd --list-ports
+  else
+    echo "未检测到防火墙"
+  fi
+  echo
+
+  # 5. 检查服务日志
+  log "5. 检查服务日志（最近20行）..."
+  journalctl -u snell -n 20 --no-pager
+  echo
+
+  # 6. 本地连接测试
+  log "6. 本地连接测试..."
+  if [ -n "$PORT" ]; then
+    if timeout 2 bash -c "echo > /dev/tcp/127.0.0.1/$PORT" 2>/dev/null; then
+      echo "✅ 本地端口 $PORT 可连接"
+    else
+      err "❌ 本地端口 $PORT 无法连接"
+    fi
+  fi
+  echo
+
+  # 7. 公网 IP
+  log "7. 服务器公网 IP..."
+  local PUBLIC_IP
+  PUBLIC_IP=$(detect_ipv4)
+  if [ -n "$PUBLIC_IP" ]; then
+    echo "公网 IP: $PUBLIC_IP"
+  else
+    warn "无法获取公网 IP"
+  fi
+  echo
+
+  # 8. Surge 配置
+  log "8. Surge 配置..."
+  if [ -f /etc/snell/config.txt ]; then
+    grep "snell," /etc/snell/config.txt | head -n 1
+  else
+    warn "未找到配置文件"
+  fi
+  echo
+
+  # 9. 总结建议
+  echo "=========================================="
+  log "💡 排查建议："
+  echo "=========================================="
+  echo
+  echo "问题1：端口未监听"
+  echo "  → 检查上面的服务日志，查看启动错误"
+  echo "  → 尝试重启服务：systemctl restart snell"
+  echo
+  echo "问题2：防火墙未开放"
+  echo "  → 运行：ufw allow $PORT/tcp"
+  echo "  → 或：firewall-cmd --permanent --add-port=$PORT/tcp && firewall-cmd --reload"
+  echo
+  echo "问题3：云服务商安全组"
+  echo "  → 登录 AWS/阿里云/腾讯云控制台"
+  echo "  → 在安全组规则中添加入站规则：TCP $PORT"
+  echo
+  echo "问题4：Surge 配置格式"
+  echo "  → 确保使用上面显示的完整配置行"
+  echo "  → 格式：name = snell, IP, PORT, psk=xxx, version=4, tfo=true, reuse=true, ecn=true"
+  echo "  → 注意：参数之间没有空格（psk=xxx 而不是 psk = xxx）"
+  echo
+  echo "问题5：Surge 客户端"
+  echo "  → 确保 Surge 版本支持 Snell v4"
+  echo "  → 尝试在 Surge 中测试延迟"
+  echo "  → 查看 Surge 日志是否有错误信息"
+  echo
+  echo "问题6：网络封锁"
+  echo "  → 某些 VPS 提供商可能封禁代理流量"
+  echo "  → 尝试更换端口（避免常见端口如 443、8080）"
+  echo "  → 考虑使用其他协议（如 sing-box 的 Reality）"
+  echo
+  echo "=========================================="
+}
+
 ############## 安装最新 sing-box ##############
 
 install_sing_box() {
@@ -1410,7 +1550,7 @@ main() {
   # 显示菜单
   while true; do
     show_menu
-    read -rp "请选择操作 [0-16]: " choice
+    read -rp "请选择操作 [0-17]: " choice
 
     case "$choice" in
       1)
@@ -1496,12 +1636,17 @@ main() {
         echo
         read -rp "按回车键继续..."
         ;;
+      17)
+        diagnose_snell
+        echo
+        read -rp "按回车键继续..."
+        ;;
       0)
         log "退出脚本"
         exit 0
         ;;
       *)
-        err "无效选择，请重新输入 [0-16]"
+        err "无效选择，请重新输入 [0-17]"
         echo
         ;;
     esac
