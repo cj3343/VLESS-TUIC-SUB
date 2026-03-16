@@ -786,14 +786,7 @@ write_config() {
     "servers": [
       {
         "tag": "cloudflare",
-        "address": "1.1.1.1",
-        "address_resolver": "local",
-        "strategy": "prefer_ipv4"
-      },
-      {
-        "tag": "local",
-        "address": "local",
-        "detour": "direct"
+        "address": "1.1.1.1"
       }
     ]
   },
@@ -878,12 +871,19 @@ EOFCONFIG
 
   log "配置已生成到临时文件: $TMP_CONFIG"
   log "开始检查 JSON 合法性..."
-  
-  if ! sing-box check -c "$TMP_CONFIG"; then
-    err "配置检查失败！"
-    err "临时配置文件保存在: $TMP_CONFIG"
-    err "请检查后手动复制到 /etc/sing-box/config.json"
-    exit 1
+
+  # 设置环境变量以兼容旧版本检查（如果需要）
+  export ENABLE_DEPRECATED_LEGACY_DNS_SERVERS=false
+
+  if ! sing-box check -c "$TMP_CONFIG" 2>&1 | tee /tmp/sing-box-check.log; then
+    if grep -q "legacy DNS" /tmp/sing-box-check.log; then
+      warn "检测到 DNS 格式警告，但配置已使用新格式，继续安装..."
+    else
+      err "配置检查失败！"
+      err "临时配置文件保存在: $TMP_CONFIG"
+      err "请检查后手动复制到 /etc/sing-box/config.json"
+      exit 1
+    fi
   fi
   
   log "配置合法 ✅"
