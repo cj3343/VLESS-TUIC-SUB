@@ -62,9 +62,10 @@ clean_old_install() {
 
 show_menu() {
   echo "========================================"
-  echo "   Sing-box VPN 一键安装脚本"
+  echo "   VPN 节点一键安装脚本"
   echo "========================================"
-  echo "1. 全新安装（推荐）"
+  echo "=== Sing-box 管理 ==="
+  echo "1. 全新安装 Sing-box（推荐）"
   echo "2. 清理旧配置后重新安装"
   echo "3. 仅清理配置（不安装）"
   echo "4. 卸载 sing-box"
@@ -75,6 +76,13 @@ show_menu() {
   echo "9. 修改 Reality 域名"
   echo "10. 综合检查（安装完整性）"
   echo "11. 重新加载节点信息和二维码"
+  echo ""
+  echo "=== Snell 管理 ==="
+  echo "12. 安装 Snell 节点"
+  echo "13. 查看 Snell 配置"
+  echo "14. 卸载 Snell"
+  echo "15. 重启 Snell 服务"
+  echo ""
   echo "0. 退出"
   echo "========================================"
   echo
@@ -454,6 +462,230 @@ reload_share_links() {
   fi
 
   gen_share_links "$vless_port" "$tuic_port" "$vless_uuid" "$tuic_uuid" "$tuic_pass"
+}
+
+############## Snell 安装与管理 ##############
+
+install_snell() {
+  log "开始安装 Snell 节点..."
+
+  # 检测系统架构
+  ARCH=$(uname -m)
+  case "$ARCH" in
+    x86_64) SNELL_ARCH="amd64" ;;
+    aarch64|arm64) SNELL_ARCH="aarch64" ;;
+    *)
+      err "不支持的 CPU 架构: $ARCH"
+      return 1
+      ;;
+  esac
+
+  # Snell 版本
+  SNELL_VERSION="v4.1.1"
+  SNELL_URL="https://dl.nssurge.com/snell/snell-server-${SNELL_VERSION}-linux-${SNELL_ARCH}.zip"
+
+  log "下载 Snell ${SNELL_VERSION} (${SNELL_ARCH})..."
+  cd /tmp
+  wget -O snell.zip "$SNELL_URL" || {
+    err "下载失败，请检查网络连接"
+    return 1
+  }
+
+  # 解压并安装
+  unzip -o snell.zip
+  install -m 755 snell-server /usr/local/bin/snell-server
+  rm -f snell.zip snell-server
+
+  # 创建 snell 用户
+  if ! id -u snell >/dev/null 2>&1; then
+    useradd -r -s /usr/sbin/nologin snell
+    log "已创建 snell 用户"
+  fi
+
+  # 生成随机端口和 PSK
+  SNELL_PORT=$(shuf -i 30000-65000 -n 1)
+  SNELL_PSK=$(tr -dc A-Za-z0-9 </dev/urandom | head -c 20)
+
+  echo
+  read -rp "Snell 端口 [默认: ${SNELL_PORT}]：" input_port
+  SNELL_PORT=${input_port:-$SNELL_PORT}
+
+  # 创建配置目录
+  mkdir -p /etc/snell
+
+  # 生成配置文件
+  cat > /etc/snell/snell-server.conf <<EOF
+[snell-server]
+listen = ::0:${SNELL_PORT}
+psk = ${SNELL_PSK}
+ipv6 = true
+EOF
+
+  log "配置文件已生成: /etc/snell/snell-server.conf"
+
+  # 创建 systemd 服务
+  cat > /etc/systemd/system/snell.service <<'EOF'
+[Unit]
+Description=Snell Proxy Service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=snell
+Group=snell
+LimitNOFILE=32768
+ExecStart=/usr/local/bin/snell-server -c /etc/snell/snell-server.conf
+AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_NET_ADMIN CAP_NET_RAW
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=snell-server
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  # 启动服务
+  systemctl daemon-reload
+  systemctl enable snell
+  systemctl start snell
+
+  sleep 2
+
+  if systemctl is-active --quiet snell; then
+    log "✅ Snell 服务启动成功"
+  else
+    err "❌ Snell 服务启动失败"
+    systemctl status snell --no-pager -l | head -n 15
+    return 1
+  fi
+
+  # 配置防火墙
+  if command -v ufw >/dev/null 2>&1; then
+    ufw allow "${SNELL_PORT}/tcp" 2>/dev/null || true
+    log "防火墙已开放端口 ${SNELL_PORT}/tcp"
+  elif command -v firewall-cmd >/dev/null 2>&1; then
+    firewall-cmd --permanent --add-port="${SNELL_PORT}/tcp"
+    firewall-cmd --reload
+    log "防火墙已开放端口 ${SNELL_PORT}/tcp"
+  fi
+
+  # 生成分享配置
+  gen_snell_config "$SNELL_PORT" "$SNELL_PSK"
+
+  log "🎉 Snell 安装完成！"
+}
+
+gen_snell_config() {
+  local PORT="$1"
+  local PSK="$2"
+
+  echo
+  local SERVER_IP
+  read -rp "服务器公网 IP [回车自动检测]：" SERVER_IP
+  if [ -z "$SERVER_IP" ]; then
+    SERVER_IP=$(detect_ipv4)
+  fi
+
+  if [ -z "$SERVER_IP" ]; then
+    err "自动检测 IP 失败"
+    return
+  fi
+
+  # 获取国家代码
+  local COUNTRY
+  COUNTRY=$(curl -s https://ipinfo.io/country 2>/dev/null || echo "VPS")
+
+  # 生成 Surge 格式配置
+  local SURGE_CONFIG="${COUNTRY} = snell, ${SERVER_IP}, ${PORT}, psk = ${PSK}, version = 4, reuse = true"
+
+  # 保存配置
+  cat > /etc/snell/config.txt <<EOF
+=== Snell 节点配置 ===
+
+服务器: ${SERVER_IP}
+端口: ${PORT}
+PSK: ${PSK}
+版本: 4
+
+=== Surge 配置 ===
+${SURGE_CONFIG}
+
+=== Shadowrocket / Surge 导入 ===
+1. 打开 Surge/Shadowrocket
+2. 添加代理 -> Snell
+3. 填入以下信息：
+   - 服务器: ${SERVER_IP}
+   - 端口: ${PORT}
+   - PSK: ${PSK}
+   - 版本: 4
+   - 复用: 开启
+EOF
+
+  echo
+  echo "================= Snell 节点配置 ================="
+  cat /etc/snell/config.txt
+  echo "=================================================="
+  echo
+  log "配置已保存到: /etc/snell/config.txt"
+}
+
+show_snell_config() {
+  if [ ! -f /etc/snell/config.txt ]; then
+    warn "未找到 Snell 配置文件，请先安装 Snell"
+    return
+  fi
+
+  echo "========================================"
+  cat /etc/snell/config.txt
+  echo "========================================"
+  echo
+  echo "服务状态："
+  systemctl status snell --no-pager -l | head -n 10
+}
+
+uninstall_snell() {
+  log "开始卸载 Snell..."
+
+  # 停止并禁用服务
+  systemctl stop snell 2>/dev/null || true
+  systemctl disable snell 2>/dev/null || true
+
+  # 删除服务文件
+  rm -f /etc/systemd/system/snell.service
+  systemctl daemon-reload
+
+  # 备份配置
+  if [ -d /etc/snell ]; then
+    local backup_name="/root/snell-backup-$(date +%Y%m%d-%H%M%S).tar.gz"
+    tar -czf "$backup_name" /etc/snell/ 2>/dev/null || true
+    log "配置已备份到: $backup_name"
+  fi
+
+  # 删除文件
+  rm -rf /etc/snell
+  rm -f /usr/local/bin/snell-server
+
+  # 删除用户
+  if id -u snell >/dev/null 2>&1; then
+    userdel snell 2>/dev/null || true
+  fi
+
+  log "✅ Snell 已完全卸载！"
+}
+
+restart_snell() {
+  if ! systemctl is-enabled --quiet snell 2>/dev/null; then
+    warn "Snell 服务未安装"
+    return
+  fi
+
+  log "重启 Snell 服务..."
+  systemctl restart snell
+  sleep 2
+  systemctl status snell --no-pager -l | head -n 10
 }
 
 ############## 安装最新 sing-box ##############
@@ -1082,11 +1314,11 @@ main() {
   # 显示菜单
   while true; do
     show_menu
-    read -rp "请选择操作 [0-11]: " choice
-    
+    read -rp "请选择操作 [0-15]: " choice
+
     case "$choice" in
       1)
-        log "开始全新安装..."
+        log "开始全新安装 Sing-box..."
         do_install
         break
         ;;
@@ -1143,12 +1375,32 @@ main() {
         echo
         read -rp "按回车键继续..."
         ;;
+      12)
+        install_snell
+        echo
+        read -rp "按回车键继续..."
+        ;;
+      13)
+        show_snell_config
+        echo
+        read -rp "按回车键继续..."
+        ;;
+      14)
+        uninstall_snell
+        echo
+        read -rp "按回车键继续..."
+        ;;
+      15)
+        restart_snell
+        echo
+        read -rp "按回车键继续..."
+        ;;
       0)
         log "退出脚本"
         exit 0
         ;;
       *)
-        err "无效选择，请重新输入 [0-11]"
+        err "无效选择，请重新输入 [0-15]"
         echo
         ;;
     esac
