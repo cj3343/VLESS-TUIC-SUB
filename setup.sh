@@ -466,8 +466,34 @@ reload_share_links() {
 
 ############## Snell 安装与管理 ##############
 
+check_snell_dependencies() {
+  local missing=0
+  for cmd in wget unzip; do
+    if ! command -v "$cmd" >/dev/null 2>&1; then
+      warn "缺少命令: $cmd"
+      missing=1
+    fi
+  done
+
+  if [ "$missing" -eq 1 ]; then
+    log "安装缺失的依赖..."
+    if command -v apt-get >/dev/null 2>&1; then
+      apt-get update -y && apt-get install -y wget unzip
+    elif command -v yum >/dev/null 2>&1; then
+      yum install -y wget unzip
+    else
+      err "无法自动安装依赖，请手动安装 wget 和 unzip"
+      return 1
+    fi
+  fi
+  return 0
+}
+
 install_snell() {
   log "开始安装 Snell 节点..."
+
+  # 检查依赖
+  check_snell_dependencies || return 1
 
   # 检测系统架构
   ARCH=$(uname -m)
@@ -480,27 +506,52 @@ install_snell() {
       ;;
   esac
 
-  # Snell 版本
+  # Snell 版本（使用最新稳定版）
   SNELL_VERSION="v4.1.1"
   SNELL_URL="https://dl.nssurge.com/snell/snell-server-${SNELL_VERSION}-linux-${SNELL_ARCH}.zip"
 
   log "下载 Snell ${SNELL_VERSION} (${SNELL_ARCH})..."
   cd /tmp
-  wget -O snell.zip "$SNELL_URL" || {
-    err "下载失败，请检查网络连接"
-    return 1
-  }
 
-  # 解压并安装
-  unzip -o snell.zip
-  install -m 755 snell-server /usr/local/bin/snell-server
+  # 清理旧文件
   rm -f snell.zip snell-server
 
-  # 创建 snell 用户
-  if ! id -u snell >/dev/null 2>&1; then
-    useradd -r -s /usr/sbin/nologin snell
-    log "已创建 snell 用户"
+  # 下载并验证
+  if ! wget --no-check-certificate -O snell.zip "$SNELL_URL"; then
+    err "下载失败，尝试使用备用源..."
+    # 备用下载源
+    SNELL_BACKUP_URL="https://raw.githubusercontent.com/xOS/Others/master/snell/v4/snell-server-${SNELL_VERSION}-linux-${SNELL_ARCH}.zip"
+    if ! wget --no-check-certificate -O snell.zip "$SNELL_BACKUP_URL"; then
+      err "所有下载源均失败，请检查网络连接"
+      return 1
+    fi
   fi
+
+  # 验证文件大小
+  if [ ! -s snell.zip ]; then
+    err "下载的文件为空"
+    return 1
+  fi
+
+  # 解压
+  if ! unzip -o snell.zip; then
+    err "解压失败，文件可能损坏"
+    rm -f snell.zip
+    return 1
+  fi
+
+  # 验证可执行文件
+  if [ ! -f snell-server ]; then
+    err "未找到 snell-server 可执行文件"
+    return 1
+  fi
+
+  # 安装到系统目录
+  chmod +x snell-server
+  mv -f snell-server /usr/local/bin/snell-server
+  rm -f snell.zip
+
+  log "✅ Snell 二进制文件已安装: /usr/local/bin/snell-server"
 
   # 生成随机端口和 PSK
   SNELL_PORT=$(shuf -i 30000-65000 -n 1)
@@ -521,22 +572,31 @@ psk = ${SNELL_PSK}
 ipv6 = true
 EOF
 
+  # 保存版本信息
+  echo "${SNELL_VERSION}" > /etc/snell/ver.txt
+
   log "配置文件已生成: /etc/snell/snell-server.conf"
 
-  # 创建 systemd 服务
-  cat > /etc/systemd/system/snell.service <<'EOF'
+  # 创建 systemd 服务（使用 root 运行，参考 xOS 实现）
+  cat > /etc/systemd/system/snell.service <<EOF
 [Unit]
 Description=Snell Proxy Service
-After=network-online.target
-Wants=network-online.target
+After=network.target
 
 [Service]
 Type=simple
-User=snell
-Group=snell
-LimitNOFILE=32768
+User=root
+LimitNOFILE=32767
 ExecStart=/usr/local/bin/snell-server -c /etc/snell/snell-server.conf
-AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_NET_ADMIN CAP_NET_RAW
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=snell-server
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target
+EOF
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=snell-server
