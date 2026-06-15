@@ -1238,6 +1238,41 @@ generate_self_signed_cert() {
 
 ############## 写入 sing-box 配置（完全重写，符合最新格式）##############
 
+generate_dns_config() {
+  local version major minor
+  version="$(sing-box version 2>/dev/null | awk 'NR==1 {print $3}')"
+  major="${version%%.*}"
+  minor="${version#*.}"
+  minor="${minor%%.*}"
+
+  if [[ "$major" =~ ^[0-9]+$ ]] && [[ "$minor" =~ ^[0-9]+$ ]] && {
+    [ "$major" -gt 1 ] || { [ "$major" -eq 1 ] && [ "$minor" -ge 12 ]; }
+  }; then
+    cat <<'EOFDNS'
+  "dns": {
+    "servers": [
+      {
+        "type": "udp",
+        "tag": "cloudflare",
+        "server": "1.1.1.1"
+      }
+    ]
+  },
+EOFDNS
+  else
+    cat <<'EOFDNS'
+  "dns": {
+    "servers": [
+      {
+        "tag": "cloudflare",
+        "address": "1.1.1.1"
+      }
+    ]
+  },
+EOFDNS
+  fi
+}
+
 write_config() {
   local VLESS_PORT="$1"
   local TUIC_PORT="$2"
@@ -1261,14 +1296,7 @@ write_config() {
     "level": "info",
     "timestamp": true
   },
-  "dns": {
-    "servers": [
-      {
-        "tag": "cloudflare",
-        "address": "1.1.1.1"
-      }
-    ]
-  },
+DNS_CONFIG_PLACEHOLDER
   "inbounds": [
     {
       "type": "vless",
@@ -1347,22 +1375,25 @@ EOFCONFIG
   sed -i "s/REALITY_DOMAIN_PLACEHOLDER/${REALITY_DOMAIN}/g" "$TMP_CONFIG"
   sed -i "s|REALITY_PRIVATE_PLACEHOLDER|${REALITY_PRIVATE}|g" "$TMP_CONFIG"
   sed -i "s/SHORT_ID_PLACEHOLDER/${SHORT_ID}/g" "$TMP_CONFIG"
+  local DNS_CONFIG
+  DNS_CONFIG="$(generate_dns_config)"
+  awk -v dns="$DNS_CONFIG" '
+    /DNS_CONFIG_PLACEHOLDER/ {
+      printf "%s\n", dns
+      next
+    }
+    { print }
+  ' "$TMP_CONFIG" > "${TMP_CONFIG}.new"
+  mv "${TMP_CONFIG}.new" "$TMP_CONFIG"
 
   log "配置已生成到临时文件: $TMP_CONFIG"
   log "开始检查 JSON 合法性..."
 
-  # 设置环境变量以兼容旧版本检查（如果需要）
-  export ENABLE_DEPRECATED_LEGACY_DNS_SERVERS=false
-
   if ! sing-box check -c "$TMP_CONFIG" 2>&1 | tee /tmp/sing-box-check.log; then
-    if grep -q "legacy DNS" /tmp/sing-box-check.log; then
-      warn "检测到 DNS 格式警告，但配置已使用新格式，继续安装..."
-    else
-      err "配置检查失败！"
-      err "临时配置文件保存在: $TMP_CONFIG"
-      err "请检查后手动复制到 /etc/sing-box/config.json"
-      exit 1
-    fi
+    err "配置检查失败！"
+    err "临时配置文件保存在: $TMP_CONFIG"
+    err "请检查后手动复制到 /etc/sing-box/config.json"
+    exit 1
   fi
   
   log "配置合法 ✅"
