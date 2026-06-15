@@ -9,6 +9,11 @@ log()  { echo -e "\033[32m[INFO]\033[0m $*"; }
 warn() { echo -e "\033[33m[WARN]\033[0m $*"; }
 err()  { echo -e "\033[31m[ERR ]\033[0m $*" >&2; }
 
+is_valid_port() {
+  local port="$1"
+  [[ "$port" =~ ^[0-9]+$ ]] && [ "$port" -ge 1 ] && [ "$port" -le 65535 ]
+}
+
 need_cmd() {
   command -v "$1" >/dev/null 2>&1 || {
     err "缺少命令: $1"
@@ -178,23 +183,35 @@ diagnose_connection() {
   
   # 4. 检查防火墙
   log "4. 检查防火墙状态..."
+  local vless_fw_port="443"
+  local tuic_fw_port="8443"
+  if command -v jq >/dev/null 2>&1 && [ -f /etc/sing-box/config.json ]; then
+    vless_fw_port=$(jq -r '.inbounds[] | select(.type=="vless" and .tag=="vless-reality") | .listen_port' /etc/sing-box/config.json 2>/dev/null | head -n 1)
+    tuic_fw_port=$(jq -r '.inbounds[] | select(.type=="tuic" and .tag=="tuic") | .listen_port' /etc/sing-box/config.json 2>/dev/null | head -n 1)
+    vless_fw_port=${vless_fw_port:-443}
+    tuic_fw_port=${tuic_fw_port:-8443}
+  fi
   if command -v ufw >/dev/null 2>&1; then
     if ufw status | grep -q "Status: active"; then
       echo "防火墙已启用，检查端口规则："
-      ufw status | grep -E "443|8443"
-      if ! ufw status | grep -q "443"; then
-        warn "⚠️  443 端口未开放！运行以下命令开放："
-        echo "  ufw allow 443/tcp"
+      ufw status | grep -E "${vless_fw_port}|${tuic_fw_port}" || true
+      if ! ufw status | grep -q "$vless_fw_port"; then
+        warn "⚠️  VLESS 端口 ${vless_fw_port}/tcp 未开放！运行以下命令开放："
+        echo "  ufw allow ${vless_fw_port}/tcp"
       fi
-      if ! ufw status | grep -q "8443"; then
-        warn "⚠️  8443 端口未开放！运行以下命令开放："
-        echo "  ufw allow 8443/udp"
+      if ! ufw status | grep -q "$tuic_fw_port"; then
+        warn "⚠️  TUIC 端口 ${tuic_fw_port}/udp 未开放！运行以下命令开放："
+        echo "  ufw allow ${tuic_fw_port}/udp"
       fi
     else
       echo "防火墙未启用"
     fi
   elif command -v firewall-cmd >/dev/null 2>&1; then
+    echo "firewalld 开放端口："
     firewall-cmd --list-ports
+  elif command -v iptables >/dev/null 2>&1; then
+    echo "iptables 端口规则："
+    iptables -S INPUT | grep -E "dport (${vless_fw_port}|${tuic_fw_port})|--dport (${vless_fw_port}|${tuic_fw_port})" || warn "未找到 VLESS/TUIC 端口放行规则"
   else
     echo "未检测到防火墙"
   fi
@@ -625,14 +642,8 @@ EOF
   fi
 
   # 配置防火墙
-  if command -v ufw >/dev/null 2>&1; then
-    ufw allow "${SNELL_PORT}/tcp" 2>/dev/null || true
-    log "防火墙已开放端口 ${SNELL_PORT}/tcp"
-  elif command -v firewall-cmd >/dev/null 2>&1; then
-    firewall-cmd --permanent --add-port="${SNELL_PORT}/tcp"
-    firewall-cmd --reload
-    log "防火墙已开放端口 ${SNELL_PORT}/tcp"
-  fi
+  open_firewall_port "$SNELL_PORT" tcp "Snell"
+  warn "如果 VPS 控制台还有安全组/云防火墙，也需要在控制台放行 ${SNELL_PORT}/tcp"
 
   # 生成分享配置
   gen_snell_config "$SNELL_PORT" "$SNELL_PSK"
@@ -1469,31 +1480,83 @@ EOF
 
 ############## 主流程 ##############
 
-setup_firewall() {
-  log "配置防火墙规则..."
-  
-  if command -v ufw >/dev/null 2>&1; then
-    # 允许 SSH（当前连接的端口）
-    ufw allow 22/tcp 2>/dev/null || true
-    
-    # 允许 VPN 端口
-    ufw allow "$1"/tcp  # VLESS
-    ufw allow "$2"/udp  # TUIC
-    
-    # 启用防火墙（如果未启用）
-    echo "y" | ufw enable 2>/dev/null || true
-    ufw status
-    
-    log "✅ 防火墙已配置"
-  elif command -v firewall-cmd >/dev/null 2>&1; then
-    # CentOS/RHEL 使用 firewalld
-    firewall-cmd --permanent --add-port="$1"/tcp
-    firewall-cmd --permanent --add-port="$2"/udp
-    firewall-cmd --reload
-    log "✅ 防火墙已配置"
-  else
-    warn "未检测到 ufw 或 firewalld，请手动配置防火墙开放端口 $1(TCP) 和 $2(UDP)"
+open_firewall_port() {
+  local port="$1"
+  local proto="$2"
+  local name="${3:-服务}"
+
+  if ! is_valid_port "$port"; then
+    warn "端口无效，跳过防火墙配置: ${port}/${proto}"
+    return 1
   fi
+
+  log "开放防火墙端口：${name} ${port}/${proto}"
+
+  if command -v ufw >/dev/null 2>&1; then
+    ufw allow 22/tcp >/dev/null 2>&1 || true
+    if ufw allow "${port}/${proto}" >/dev/null 2>&1; then
+      if ! ufw status 2>/dev/null | grep -q "Status: active"; then
+        echo "y" | ufw enable >/dev/null 2>&1 || warn "ufw 未启用，请手动执行: ufw enable"
+      fi
+      log "✅ ufw 已开放 ${port}/${proto}"
+      return 0
+    fi
+    warn "ufw 放行 ${port}/${proto} 失败，继续尝试其他防火墙工具"
+  fi
+
+  if command -v firewall-cmd >/dev/null 2>&1; then
+    if systemctl is-active --quiet firewalld 2>/dev/null; then
+      firewall-cmd --permanent --add-port="${port}/${proto}" >/dev/null 2>&1 || true
+      firewall-cmd --reload >/dev/null 2>&1 || true
+      log "✅ firewalld 已开放 ${port}/${proto}"
+      return 0
+    else
+      warn "检测到 firewall-cmd，但 firewalld 未运行，继续尝试 iptables"
+    fi
+  fi
+
+  if command -v iptables >/dev/null 2>&1; then
+    if ! iptables -C INPUT -p "$proto" --dport "$port" -j ACCEPT >/dev/null 2>&1; then
+      iptables -I INPUT -p "$proto" --dport "$port" -j ACCEPT >/dev/null 2>&1 || true
+    fi
+    if command -v ip6tables >/dev/null 2>&1; then
+      if ! ip6tables -C INPUT -p "$proto" --dport "$port" -j ACCEPT >/dev/null 2>&1; then
+        ip6tables -I INPUT -p "$proto" --dport "$port" -j ACCEPT >/dev/null 2>&1 || true
+      fi
+    fi
+
+    if command -v netfilter-persistent >/dev/null 2>&1; then
+      netfilter-persistent save >/dev/null 2>&1 || true
+      log "✅ iptables 已开放并尝试持久化 ${port}/${proto}"
+    elif command -v service >/dev/null 2>&1 && service iptables status >/dev/null 2>&1; then
+      service iptables save >/dev/null 2>&1 || true
+      log "✅ iptables 已开放并尝试持久化 ${port}/${proto}"
+    else
+      log "✅ iptables 已开放 ${port}/${proto}"
+      warn "当前系统未检测到 iptables 持久化工具，重启后规则可能失效"
+    fi
+    return 0
+  fi
+
+  warn "未检测到 ufw/firewalld/iptables，请手动开放 ${name} 端口: ${port}/${proto}"
+  return 1
+}
+
+setup_firewall() {
+  local vless_port="$1"
+  local tuic_port="$2"
+
+  log "配置 sing-box 防火墙规则..."
+  open_firewall_port "$vless_port" tcp "VLESS Reality"
+  open_firewall_port "$tuic_port" udp "TUIC"
+
+  if command -v ufw >/dev/null 2>&1; then
+    ufw status || true
+  elif command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active --quiet firewalld 2>/dev/null; then
+    firewall-cmd --list-ports || true
+  fi
+
+  warn "如果 VPS 控制台还有安全组/云防火墙，也需要在控制台放行 ${vless_port}/tcp 和 ${tuic_port}/udp"
 }
 
 do_install() {
