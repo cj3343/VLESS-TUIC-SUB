@@ -486,7 +486,7 @@ reload_share_links() {
 ############## Snell 安装与管理 ##############
 
 check_snell_dependencies() {
-  local missing=0
+  local missing=0 install_pkgs="wget unzip ca-certificates"
   for cmd in wget unzip; do
     if ! command -v "$cmd" >/dev/null 2>&1; then
       warn "缺少命令: $cmd"
@@ -497,13 +497,25 @@ check_snell_dependencies() {
   if [ "$missing" -eq 1 ]; then
     log "安装缺失的依赖..."
     if command -v apt-get >/dev/null 2>&1; then
-      apt-get update -y && apt-get install -y wget unzip
+      apt-get update -y && apt-get install -y $install_pkgs
+    elif command -v dnf >/dev/null 2>&1; then
+      dnf install -y $install_pkgs
     elif command -v yum >/dev/null 2>&1; then
-      yum install -y wget unzip
+      yum install -y $install_pkgs
+    elif command -v apk >/dev/null 2>&1; then
+      apk add --no-cache $install_pkgs
     else
-      err "无法自动安装依赖，请手动安装 wget 和 unzip"
+      err "无法自动安装依赖，请手动安装: $install_pkgs"
       return 1
     fi
+
+    for cmd in wget unzip; do
+      if ! command -v "$cmd" >/dev/null 2>&1; then
+        err "依赖安装后仍缺少命令: $cmd"
+        err "请先手动安装: $install_pkgs"
+        return 1
+      fi
+    done
   fi
   return 0
 }
@@ -553,6 +565,13 @@ install_snell() {
   fi
 
   # 解压
+  if ! command -v unzip >/dev/null 2>&1; then
+    err "缺少 unzip，无法解压 Snell 安装包"
+    err "请先安装 unzip 后重试"
+    rm -f snell.zip
+    return 1
+  fi
+
   if ! unzip -o snell.zip; then
     err "解压失败，文件可能损坏"
     rm -f snell.zip
