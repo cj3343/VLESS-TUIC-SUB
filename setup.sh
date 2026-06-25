@@ -21,6 +21,15 @@ need_cmd() {
   }
 }
 
+require_root() {
+  if [ "$(id -u)" -ne 0 ]; then
+    err "当前操作需要 root 权限"
+    err "请使用 root 登录，或用 sudo 运行本脚本，例如：sudo bash setup.sh"
+    return 1
+  fi
+  return 0
+}
+
 ############## 清理旧配置 ##############
 
 clean_old_install() {
@@ -89,6 +98,15 @@ show_menu() {
   echo "15. 重启 Snell 服务"
   echo "16. 重新生成 Snell 配置"
   echo "17. 🔍 诊断 Snell 连接问题"
+  echo ""
+  echo ""
+  echo "=== 系统加固 ==="
+  echo "18. 🛡️  一键安全加固（推荐，执行全部）"
+  echo "19. 配置 Swap 内存"
+  echo "20. 安装 Fail2Ban 防暴力破解"
+  echo "21. SSH 安全加固（禁用密码登录）"
+  echo "22. 修复 DRM CPU 占满（QEMU/Evoxt）"
+  echo "23. 查看系统安全状态"
   echo ""
   echo "0. 退出"
   echo "========================================"
@@ -497,13 +515,13 @@ check_snell_dependencies() {
   if [ "$missing" -eq 1 ]; then
     log "安装缺失的依赖..."
     if command -v apt-get >/dev/null 2>&1; then
-      apt-get update -y && apt-get install -y $install_pkgs
+      apt-get update -y && apt-get install -y $install_pkgs || return 1
     elif command -v dnf >/dev/null 2>&1; then
-      dnf install -y $install_pkgs
+      dnf install -y $install_pkgs || return 1
     elif command -v yum >/dev/null 2>&1; then
-      yum install -y $install_pkgs
+      yum install -y $install_pkgs || return 1
     elif command -v apk >/dev/null 2>&1; then
-      apk add --no-cache $install_pkgs
+      apk add --no-cache $install_pkgs || return 1
     else
       err "无法自动安装依赖，请手动安装: $install_pkgs"
       return 1
@@ -522,6 +540,8 @@ check_snell_dependencies() {
 
 install_snell() {
   log "开始安装 Snell 节点..."
+
+  require_root || return 1
 
   # 检查依赖
   check_snell_dependencies || return 1
@@ -1528,6 +1548,440 @@ EOF
   fi
 }
 
+############## 系统加固 ##############
+
+setup_swap() {
+  echo "========================================"
+  echo "💾 配置 Swap 内存"
+  echo "========================================"
+
+  require_root || return 1
+
+  if swapon --show | grep -q "/swapfile"; then
+    log "Swap 已存在："
+    swapon --show
+    free -h | grep -i swap
+    read -rp "是否重新配置？(y/n): " redo
+    if [[ ! "$redo" =~ ^[Yy]$ ]]; then
+      log "跳过 Swap 配置"
+      return 0
+    fi
+    swapoff /swapfile 2>/dev/null || true
+    rm -f /swapfile
+    sed -i '/\/swapfile/d' /etc/fstab
+  fi
+
+  local MEM_MB
+  MEM_MB=$(awk '/MemTotal/ {print int($2/1024)}' /proc/meminfo)
+  local SWAP_MB
+  if [ "$MEM_MB" -le 512 ]; then
+    SWAP_MB=1024
+  elif [ "$MEM_MB" -le 2048 ]; then
+    SWAP_MB=1024
+  else
+    SWAP_MB=2048
+  fi
+
+  log "物理内存: ${MEM_MB}MB，创建 ${SWAP_MB}MB Swap..."
+  fallocate -l "${SWAP_MB}M" /swapfile
+  chmod 600 /swapfile
+  mkswap /swapfile
+  swapon /swapfile
+  echo '/swapfile none swap sw 0 0' >> /etc/fstab
+
+  if ! grep -q 'vm.swappiness' /etc/sysctl.conf; then
+    echo 'vm.swappiness=10' >> /etc/sysctl.conf
+  fi
+  sysctl -p >/dev/null 2>&1
+
+  log "✅ Swap 配置完成"
+  free -h | grep -i swap
+}
+
+setup_fail2ban() {
+  echo "========================================"
+  echo "🔒 安装 Fail2Ban"
+  echo "========================================"
+
+  require_root || return 1
+
+  if command -v fail2ban-client >/dev/null 2>&1; then
+    log "Fail2Ban 已安装"
+    systemctl status fail2ban --no-pager | head -5
+    read -rp "是否重新配置？(y/n): " redo
+    if [[ ! "$redo" =~ ^[Yy]$ ]]; then
+      return 0
+    fi
+  else
+    log "安装 Fail2Ban..."
+    if command -v apt-get >/dev/null 2>&1; then
+      apt-get update -qq && apt-get install -y -qq fail2ban
+    elif command -v yum >/dev/null 2>&1; then
+      yum install -y -q fail2ban
+    else
+      err "无法自动安装，请手动安装 fail2ban"
+      return 1
+    fi
+  fi
+
+  cat > /etc/fail2ban/jail.local <<'EOF'
+[DEFAULT]
+bantime = 3600
+findtime = 600
+maxretry = 5
+banaction = ufw
+
+[sshd]
+enabled = true
+port = 22
+filter = sshd
+logpath = /var/log/auth.log
+maxretry = 3
+bantime = 86400
+EOF
+
+  systemctl enable fail2ban
+  systemctl restart fail2ban
+  sleep 2
+
+  if systemctl is-active --quiet fail2ban; then
+    log "✅ Fail2Ban 已启动"
+    fail2ban-client status sshd 2>/dev/null || true
+  else
+    err "❌ Fail2Ban 启动失败"
+    journalctl -u fail2ban --no-pager -n 10
+  fi
+}
+
+harden_ssh() {
+  echo "========================================"
+  echo "🔑 SSH 安全加固"
+  echo "========================================"
+
+  require_root || return 1
+
+  local SERVER_IP
+  SERVER_IP=$(curl -4s --max-time 3 https://api.ip.sb 2>/dev/null | grep -Eo '([0-9]{1,3}\.){3}[0-9]{1,3}' | head -n1)
+  SERVER_IP=${SERVER_IP:-服务器IP}
+
+  # Step 1: 引导用户在本地生成密钥
+  echo
+  log "【第 1 步/共 4 步】在你的电脑上生成 SSH 密钥"
+  echo
+  echo "  ▸ Mac 用户：打开「终端」输入："
+  echo "    ssh-keygen -t ed25519"
+  echo
+  echo "  ▸ Windows 用户：打开「PowerShell」输入："
+  echo "    ssh-keygen -t ed25519"
+  echo
+  echo "  一路回车即可，生成两个文件："
+  echo "  ┌──────────────────────────────────────────────────┐"
+  echo "  │ 私钥（自己留着，不给任何人）                       │"
+  echo "  │   Mac:     ~/.ssh/id_ed25519                     │"
+  echo "  │   Windows: C:\\Users\\你的用户名\\.ssh\\id_ed25519     │"
+  echo "  │                                                  │"
+  echo "  │ 公钥（给服务器）                                   │"
+  echo "  │   Mac:     ~/.ssh/id_ed25519.pub                 │"
+  echo "  │   Windows: C:\\Users\\你的用户名\\.ssh\\id_ed25519.pub │"
+  echo "  └──────────────────────────────────────────────────┘"
+  echo
+  log "获取公钥内容："
+  echo "  1. 打开上面路径的 .pub 文件（用记事本或任意文本编辑器）"
+  echo "  2. 复制里面整行内容（以 ssh-ed25519 开头）"
+  echo "  3. 粘贴到下方"
+  echo
+  read -rp "粘贴公钥（留空则跳过，使用服务器已有密钥）：" PUB_KEY
+
+  # 如果留空，检查服务器是否已有密钥
+  if [ -z "$PUB_KEY" ]; then
+    if [ -f /root/.ssh/authorized_keys ] && [ -s /root/.ssh/authorized_keys ]; then
+      log "使用服务器已有的 authorized_keys"
+    else
+      err "未输入公钥且服务器无已有密钥，无法继续"
+      return 1
+    fi
+  else
+    # 验证公钥格式
+    if ! echo "$PUB_KEY" | grep -qE '^ssh-(ed25519|rsa) '; then
+      err "公钥格式不正确，应以 ssh-ed25519 或 ssh-rsa 开头"
+      return 1
+    fi
+
+    mkdir -p /root/.ssh
+    chmod 700 /root/.ssh
+    echo "$PUB_KEY" >> /root/.ssh/authorized_keys
+    chmod 600 /root/.ssh/authorized_keys
+    sort -u -o /root/.ssh/authorized_keys /root/.ssh/authorized_keys
+    log "✅ 公钥已写入 authorized_keys"
+  fi
+
+  # Step 2: Termius 配置教程
+  echo
+  log "【第 2 步/共 4 步】配置 Termius 登录"
+  echo "  ┌──────────────────────────────────────────────────┐"
+  echo "  │ 1. 打开 Termius → 左侧栏 Keychain               │"
+  echo "  │ 2. 点击 + → Import Key                           │"
+  echo "  │ 3. 选择你电脑上的私钥文件：                         │"
+  echo "  │    Mac:     ~/.ssh/id_ed25519                    │"
+  echo "  │    Windows: C:\\Users\\你的用户名\\.ssh\\id_ed25519    │"
+  echo "  │ 4. 新建 Host：                                    │"
+  echo "  │    Address:  ${SERVER_IP}                        │"
+  echo "  │    Username: root                                │"
+  echo "  │    Key:      选刚导入的密钥                        │"
+  echo "  │ 5. 点击 Connect 测试连接                          │"
+  echo "  └──────────────────────────────────────────────────┘"
+
+  # Step 3: 验证密钥可登录
+  echo
+  log "【第 3 步/共 4 步】验证密钥登录"
+  echo
+  echo "  请用以下任一方式验证能登录服务器："
+  echo "  ▸ Termius：用上面配置的 Host 连接"
+  echo "  ▸ 终端：  ssh root@${SERVER_IP}"
+  echo
+  read -rp "我已验证密钥登录成功，继续禁用密码登录？(yes/no): " confirm
+  if [ "$confirm" != "yes" ]; then
+    log "已取消，密码登录保持开启"
+    return 0
+  fi
+
+  # Step 4: 禁用密码登录
+  log "【第 4 步/共 4 步】禁用密码登录..."
+  cp /etc/ssh/sshd_config "/etc/ssh/sshd_config.bak-$(date +%Y%m%d%H%M)"
+
+  sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin prohibit-password/' /etc/ssh/sshd_config
+  sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config
+  sed -i 's/^#\?PubkeyAuthentication.*/PubkeyAuthentication yes/' /etc/ssh/sshd_config
+  sed -i 's/^#\?PermitEmptyPasswords.*/PermitEmptyPasswords no/' /etc/ssh/sshd_config
+  sed -i 's/^#\?X11Forwarding.*/X11Forwarding no/' /etc/ssh/sshd_config
+  sed -i 's/^#\?MaxAuthTries.*/MaxAuthTries 3/' /etc/ssh/sshd_config
+  sed -i 's/^#\?LoginGraceTime.*/LoginGraceTime 30/' /etc/ssh/sshd_config
+
+  # 修复 cloud-init 覆盖配置
+  if [ -d /etc/ssh/sshd_config.d ]; then
+    for f in /etc/ssh/sshd_config.d/*.conf; do
+      [ -f "$f" ] || continue
+      if grep -qi 'PasswordAuthentication yes' "$f" 2>/dev/null; then
+        sed -i 's/^PasswordAuthentication yes/PasswordAuthentication no/i' "$f"
+        log "已修复覆盖配置: $f"
+      fi
+    done
+  fi
+
+  systemctl restart sshd 2>/dev/null || systemctl restart ssh 2>/dev/null
+
+  log "✅ SSH 加固完成"
+  echo
+  sshd -T 2>/dev/null | grep -E '^(passwordauthentication|pubkeyauthentication|permitrootlogin|maxauthtries|logracetime)' || true
+}
+
+fix_drm_cpu() {
+  echo "========================================"
+  echo "🖥️  修复 DRM CPU 占用"
+  echo "========================================"
+
+  require_root || return 1
+
+  local NEEDS_FIX=0
+  local IS_QEMU=0
+
+  # 检测是否为 QEMU/KVM 虚拟机
+  if systemd-detect-virt 2>/dev/null | grep -qiE 'qemu|kvm'; then
+    IS_QEMU=1
+    log "检测到 QEMU/KVM 虚拟化环境"
+  elif [ -f /sys/class/dmi/id/sys_vendor ] && grep -qi qemu /sys/class/dmi/id/sys_vendor 2>/dev/null; then
+    IS_QEMU=1
+    log "检测到 QEMU 虚拟化环境"
+  fi
+
+  # 检查 cirrus DRM 模块
+  if lsmod 2>/dev/null | grep -q cirrus; then
+    NEEDS_FIX=1
+    warn "检测到 cirrus 虚拟显卡模块已加载"
+  fi
+
+  # 检查 CPU hog 日志
+  if dmesg 2>/dev/null | grep -q 'drm_fb_helper_damage_work hogged CPU'; then
+    NEEDS_FIX=1
+    warn "检测到 DRM CPU 占用日志"
+  fi
+
+  # 检查是否已修复
+  if grep -q 'nomodeset' /proc/cmdline 2>/dev/null; then
+    log "✅ nomodeset 已生效（内核启动参数已包含）"
+    if [ -f /etc/modprobe.d/blacklist-cirrus.conf ]; then
+      log "✅ cirrus 模块已加入黑名单"
+    fi
+    return 0
+  fi
+
+  if [ -f /etc/modprobe.d/blacklist-cirrus.conf ] && ! lsmod 2>/dev/null | grep -q cirrus; then
+    log "✅ DRM 修复已应用（cirrus 模块已卸载）"
+    return 0
+  fi
+
+  if [ "$IS_QEMU" -eq 0 ] && [ "$NEEDS_FIX" -eq 0 ]; then
+    log "当前环境未检测到 DRM CPU 占用问题"
+    return 0
+  fi
+
+  echo
+  warn "发现问题，开始修复..."
+
+  # 卸载当前加载的模块
+  modprobe -r vga16fb 2>/dev/null || true
+  modprobe -r vgastate 2>/dev/null || true
+  modprobe -r cirrus_qemu 2>/dev/null || true
+
+  # 加入黑名单
+  cat > /etc/modprobe.d/blacklist-cirrus.conf <<'EOF'
+blacklist cirrus
+blacklist vga16fb
+blacklist vgastate
+EOF
+
+  # 加入内核启动参数
+  if ! grep -q 'nomodeset' /etc/default/grub 2>/dev/null; then
+    sed -i 's/GRUB_CMDLINE_LINUX_DEFAULT=""/GRUB_CMDLINE_LINUX_DEFAULT="nomodeset"/' /etc/default/grub
+    if grep -q 'GRUB_CMDLINE_LINUX_DEFAULT=""' /etc/default/grub; then
+      sed -i 's/GRUB_CMDLINE_LINUX_DEFAULT="\(.*\)"/GRUB_CMDLINE_LINUX_DEFAULT="\1 nomodeset"/' /etc/default/grub
+    fi
+    if command -v update-grub >/dev/null 2>&1; then
+      update-grub >/dev/null 2>&1
+    elif command -v grub2-mkconfig >/dev/null 2>&1; then
+      grub2-mkconfig -o /boot/grub2/grub.cfg >/dev/null 2>&1
+    fi
+    log "已添加 nomodeset 到内核启动参数"
+  fi
+
+  # 更新 initramfs
+  if command -v update-initramfs >/dev/null 2>&1; then
+    update-initramfs -u >/dev/null 2>&1
+  fi
+
+  log "✅ DRM 修复完成，重启后生效"
+  warn "需要重启服务器: reboot"
+}
+
+show_security_status() {
+  echo "========================================"
+  echo "📊 系统安全状态"
+  echo "========================================"
+  echo
+
+  # SSH
+  log "🔑 SSH 配置："
+  if command -v sshd >/dev/null 2>&1; then
+    local pw_auth pubkey_auth root_login max_tries
+    pw_auth=$(sshd -T 2>/dev/null | grep '^passwordauthentication' | awk '{print $2}')
+    pubkey_auth=$(sshd -T 2>/dev/null | grep '^pubkeyauthentication' | awk '{print $2}')
+    root_login=$(sshd -T 2>/dev/null | grep '^permitrootlogin' | awk '{print $2}')
+    max_tries=$(sshd -T 2>/dev/null | grep '^maxauthtries' | awk '{print $2}')
+
+    if [ "$pw_auth" = "no" ]; then
+      echo "  ✅ 密码登录: 已禁用"
+    else
+      echo "  ⚠️  密码登录: 已启用"
+    fi
+    echo "  公钥认证: ${pubkey_auth:-未知}"
+    echo "  Root 登录: ${root_login:-未知}"
+    echo "  最大重试: ${max_tries:-未知}"
+  fi
+  echo
+
+  # Fail2Ban
+  log "🔒 Fail2Ban："
+  if command -v fail2ban-client >/dev/null 2>&1; then
+    if systemctl is-active --quiet fail2ban; then
+      echo "  ✅ 运行中"
+      fail2ban-client status sshd 2>/dev/null | grep -E 'banned|failed' || true
+    else
+      echo "  ⚠️  已安装但未运行"
+    fi
+  else
+    echo "  ❌ 未安装"
+  fi
+  echo
+
+  # Swap
+  log "💾 Swap："
+  if swapon --show 2>/dev/null | grep -q swap; then
+    echo "  ✅ 已启用"
+    free -h | grep -i swap
+  else
+    echo "  ❌ 未配置"
+  fi
+  echo
+
+  # 防火墙
+  log "🧱 防火墙："
+  if command -v ufw >/dev/null 2>&1; then
+    ufw status | head -10
+  else
+    echo "  未检测到 ufw"
+  fi
+  echo
+
+  # DRM
+  log "🖥️  DRM 模块："
+  if lsmod 2>/dev/null | grep -q cirrus; then
+    echo "  ⚠️  cirrus 虚拟显卡已加载（可能导致 CPU 100%）"
+  else
+    echo "  ✅ 无问题"
+  fi
+  if grep -q 'nomodeset' /proc/cmdline 2>/dev/null; then
+    echo "  ✅ nomodeset 已生效"
+  fi
+  echo
+
+  # 系统概况
+  log "📈 系统概况："
+  echo "  运行时间: $(uptime -p 2>/dev/null || uptime)"
+  echo "  内存使用: $(free -h | awk '/Mem/ {print $3"/"$2}')"
+  echo "  磁盘使用: $(df -h / | awk 'NR==2 {print $3"/"$2" ("$5")"}')"
+  echo "  CPU 负载: $(cat /proc/loadavg | awk '{print $1, $2, $3}')"
+}
+
+one_click_harden() {
+  echo "========================================"
+  echo "🛡️  一键安全加固"
+  echo "========================================"
+  echo
+  warn "将依次执行以下操作："
+  echo "  1. 配置 Swap 内存"
+  echo "  2. 安装 Fail2Ban"
+  echo "  3. SSH 安全加固（生成密钥 → 配置 Termius → 验证 → 禁密码）"
+  echo "  4. 修复 DRM CPU 占用（如适用）"
+  echo
+  read -rp "确认执行？(yes/no): " confirm
+  if [ "$confirm" != "yes" ]; then
+    log "已取消"
+    return 0
+  fi
+
+  echo
+  log "【1/4】配置 Swap..."
+  setup_swap
+
+  echo
+  log "【2/4】安装 Fail2Ban..."
+  setup_fail2ban
+
+  echo
+  log "【3/4】SSH 安全加固..."
+  harden_ssh
+
+  echo
+  log "【4/4】检查 DRM CPU 占用..."
+  fix_drm_cpu
+
+  echo
+  echo "========================================"
+  log "🎉 安全加固完成！"
+  echo "========================================"
+  show_security_status
+}
+
 ############## 主流程 ##############
 
 open_firewall_port() {
@@ -1663,7 +2117,7 @@ main() {
   # 显示菜单
   while true; do
     show_menu
-    read -rp "请选择操作 [0-17]: " choice
+    read -rp "请选择操作 [0-23]: " choice
 
     case "$choice" in
       1)
@@ -1754,12 +2208,42 @@ main() {
         echo
         read -rp "按回车键继续..."
         ;;
+      18)
+        one_click_harden
+        echo
+        read -rp "按回车键继续..."
+        ;;
+      19)
+        setup_swap
+        echo
+        read -rp "按回车键继续..."
+        ;;
+      20)
+        setup_fail2ban
+        echo
+        read -rp "按回车键继续..."
+        ;;
+      21)
+        harden_ssh
+        echo
+        read -rp "按回车键继续..."
+        ;;
+      22)
+        fix_drm_cpu
+        echo
+        read -rp "按回车键继续..."
+        ;;
+      23)
+        show_security_status
+        echo
+        read -rp "按回车键继续..."
+        ;;
       0)
         log "退出脚本"
         exit 0
         ;;
       *)
-        err "无效选择，请重新输入 [0-17]"
+        err "无效选择，请重新输入 [0-23]"
         echo
         ;;
     esac
