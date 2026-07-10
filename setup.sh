@@ -107,6 +107,8 @@ show_menu() {
   echo "21. SSH 安全加固（禁用密码登录）"
   echo "22. 修复 DRM CPU 占满（QEMU/Evoxt）"
   echo "23. 查看系统安全状态"
+  echo "24. 🔍 简单安全检查（是否被攻击粗检）"
+  echo "25. 🧱 防火墙管理（安装/开关/端口）"
   echo ""
   echo "0. 退出"
   echo "========================================"
@@ -1915,11 +1917,32 @@ show_security_status() {
 
   # 防火墙
   log "🧱 防火墙："
-  if command -v ufw >/dev/null 2>&1; then
-    ufw status | head -10
-  else
-    echo "  未检测到 ufw"
-  fi
+  local fw_type
+  fw_type=$(detect_firewall)
+  case "$fw_type" in
+    ufw)
+      echo "  类型: ufw"
+      if ufw status 2>/dev/null | grep -q "Status: active"; then
+        echo "  ✅ 状态: 已启用"
+      else
+        echo "  ⚠️  状态: 未启用"
+      fi
+      ufw status 2>/dev/null | head -12 || true
+      ;;
+    firewalld)
+      echo "  类型: firewalld"
+      if systemctl is-active --quiet firewalld 2>/dev/null; then
+        echo "  ✅ 状态: 运行中"
+        firewall-cmd --list-ports 2>/dev/null || true
+        firewall-cmd --list-services 2>/dev/null || true
+      else
+        echo "  ⚠️  状态: 未运行"
+      fi
+      ;;
+    *)
+      echo "  ❌ 未检测到 ufw/firewalld"
+      ;;
+  esac
   echo
 
   # DRM
@@ -1942,6 +1965,497 @@ show_security_status() {
   echo "  CPU 负载: $(cat /proc/loadavg | awk '{print $1, $2, $3}')"
 }
 
+############## 简单安全检查 + 防火墙管理 ##############
+
+detect_firewall() {
+  if command -v ufw >/dev/null 2>&1; then
+    echo "ufw"
+  elif command -v firewall-cmd >/dev/null 2>&1; then
+    echo "firewalld"
+  else
+    echo "none"
+  fi
+}
+
+simple_security_check() {
+  echo "========================================"
+  echo "🔍 简单安全检查（粗检）"
+  echo "========================================"
+  echo
+  warn "只读检查，不会修改系统。发现异常请人工确认。"
+  echo
+
+  local flags=0
+
+  # 1. 最近成功登录
+  log "1) 最近成功登录"
+  if command -v last >/dev/null 2>&1; then
+    last -n 10 -a 2>/dev/null || last -n 10 2>/dev/null || echo "  无法读取 last"
+  else
+    echo "  ❌ 无 last 命令"
+  fi
+  echo
+
+  # 2. SSH 失败登录（近 24h 粗计）
+  log "2) 近 24 小时 SSH 失败登录（粗计）"
+  local fail_count=0
+  local auth_file=""
+  if [ -f /var/log/auth.log ]; then
+    auth_file=/var/log/auth.log
+  elif [ -f /var/log/secure ]; then
+    auth_file=/var/log/secure
+  fi
+  if [ -n "$auth_file" ]; then
+    # 粗计：文件中 Failed password / Invalid user 行数（不严格按 24h 切分，够用）
+    fail_count=$(grep -cE 'Failed password|Invalid user|authentication failure' "$auth_file" 2>/dev/null || true)
+    fail_count=${fail_count//[^0-9]/}
+    fail_count=${fail_count:-0}
+    if [ "$fail_count" -ge 50 ] 2>/dev/null; then
+      echo "  ⚠️  失败相关日志约 ${fail_count} 条（可能在被扫）: $auth_file"
+      flags=$((flags + 1))
+    elif [ "$fail_count" -gt 0 ] 2>/dev/null; then
+      echo "  ✅ 失败相关日志约 ${fail_count} 条: $auth_file"
+    else
+      echo "  ✅ 未统计到失败记录: $auth_file"
+    fi
+    grep -E 'Failed password|Invalid user' "$auth_file" 2>/dev/null | tail -n 5 || true
+  else
+    echo "  ⚠️  未找到 auth.log/secure，可查: journalctl -u ssh"
+  fi
+  echo
+
+  # 3. CPU TOP5
+  log "3) CPU 占用 TOP5"
+  ps aux --sort=-%cpu 2>/dev/null | head -n 6 || ps aux | head -n 6
+  echo
+
+  # 4. 监听端口
+  log "4) 当前监听端口"
+  if command -v ss >/dev/null 2>&1; then
+    ss -tulnp 2>/dev/null | head -n 20 || true
+  elif command -v netstat >/dev/null 2>&1; then
+    netstat -tulnp 2>/dev/null | head -n 20 || true
+  else
+    echo "  ❌ 无 ss/netstat"
+  fi
+  echo
+
+  # 5. 临时目录可执行文件
+  log "5) 临时目录可执行文件"
+  local tmp_exes
+  tmp_exes=$(find /tmp /var/tmp /dev/shm -type f -executable 2>/dev/null | head -n 20 || true)
+  if [ -n "$tmp_exes" ]; then
+    echo "  ⚠️  发现可执行文件："
+    echo "$tmp_exes"
+    flags=$((flags + 1))
+  else
+    echo "  ✅ 未发现"
+  fi
+  echo
+
+  # 6. authorized_keys
+  log "6) root SSH 公钥 (authorized_keys)"
+  if [ -f /root/.ssh/authorized_keys ]; then
+    local key_lines
+    key_lines=$(grep -cE '^\s*ssh-' /root/.ssh/authorized_keys 2>/dev/null || true)
+    key_lines=${key_lines//[^0-9]/}
+    key_lines=${key_lines:-0}
+    echo "  文件存在，公钥约 ${key_lines} 条"
+    if [ "$key_lines" -gt 5 ] 2>/dev/null; then
+      echo "  ⚠️  公钥偏多，请核对是否本人添加"
+      flags=$((flags + 1))
+    else
+      echo "  ✅ 数量正常（仍建议人工核对内容）"
+    fi
+  else
+    echo "  ⚠️  /root/.ssh/authorized_keys 不存在"
+  fi
+  echo
+
+  # 7. 额外 uid=0
+  log "7) uid=0 用户"
+  local uid0
+  uid0=$(awk -F: '$3==0 {print $1}' /etc/passwd 2>/dev/null || true)
+  echo "  $uid0"
+  local uid0_count
+  uid0_count=$(echo "$uid0" | wc -w | tr -d ' ')
+  if [ "${uid0_count:-0}" -gt 1 ] 2>/dev/null; then
+    echo "  ⚠️  存在多个 uid=0 账户"
+    flags=$((flags + 1))
+  else
+    echo "  ✅ 仅 root（或正常）"
+  fi
+  echo
+
+  # 8. Fail2Ban
+  log "8) Fail2Ban"
+  if command -v fail2ban-client >/dev/null 2>&1; then
+    if systemctl is-active --quiet fail2ban 2>/dev/null; then
+      echo "  ✅ 运行中"
+      fail2ban-client status sshd 2>/dev/null | grep -E 'Currently banned|Total banned|Currently failed' || true
+    else
+      echo "  ⚠️  已安装但未运行"
+    fi
+  else
+    echo "  ❌ 未安装（可选：菜单 20）"
+  fi
+  echo
+
+  # 9. 防火墙
+  log "9) 防火墙"
+  local fw
+  fw=$(detect_firewall)
+  case "$fw" in
+    ufw)
+      if ufw status 2>/dev/null | grep -q "Status: active"; then
+        echo "  ✅ ufw 已启用"
+      else
+        echo "  ⚠️  ufw 已装未启用"
+        flags=$((flags + 1))
+      fi
+      ;;
+    firewalld)
+      if systemctl is-active --quiet firewalld 2>/dev/null; then
+        echo "  ✅ firewalld 运行中"
+      else
+        echo "  ⚠️  firewalld 未运行"
+        flags=$((flags + 1))
+      fi
+      ;;
+    *)
+      echo "  ⚠️  未检测到主机防火墙"
+      flags=$((flags + 1))
+      ;;
+  esac
+  echo
+
+  # 10. 结论
+  log "10) 结论"
+  if [ "$flags" -gt 0 ]; then
+    echo "  ⚠️  发现 ${flags} 类需关注项，请对照上方输出人工确认（粗检不能证明已被入侵）。"
+  else
+    echo "  ✅ 未发现明显异常（仅粗检，不能 100% 证明安全）。"
+  fi
+  echo
+  echo "提示：被扫很常见；真正危险是陌生成功登录、陌生公钥、临时目录木马、异常出站进程。"
+}
+
+install_firewall() {
+  require_root || return 1
+
+  local fw
+  fw=$(detect_firewall)
+  if [ "$fw" != "none" ]; then
+    log "已检测到防火墙工具: $fw"
+    return 0
+  fi
+
+  log "安装防火墙..."
+  if command -v apt-get >/dev/null 2>&1; then
+    apt-get update -qq && apt-get install -y -qq ufw
+  elif command -v dnf >/dev/null 2>&1; then
+    dnf install -y -q firewalld || yum install -y -q firewalld
+  elif command -v yum >/dev/null 2>&1; then
+    yum install -y -q firewalld
+  else
+    err "无法自动安装，请手动安装 ufw 或 firewalld"
+    return 1
+  fi
+
+  fw=$(detect_firewall)
+  if [ "$fw" = "none" ]; then
+    err "安装后仍未检测到防火墙命令"
+    return 1
+  fi
+  log "✅ 已安装: $fw"
+}
+
+enable_firewall() {
+  require_root || return 1
+
+  local fw
+  fw=$(detect_firewall)
+  if [ "$fw" = "none" ]; then
+    warn "未安装防火墙，先安装..."
+    install_firewall || return 1
+    fw=$(detect_firewall)
+  fi
+
+  case "$fw" in
+    ufw)
+      # 防锁死：先放行 SSH
+      ufw allow OpenSSH >/dev/null 2>&1 || ufw allow 22/tcp >/dev/null 2>&1 || true
+      if ufw status 2>/dev/null | grep -q "Status: active"; then
+        log "✅ ufw 已处于启用状态"
+      else
+        log "启用 ufw（已尝试放行 22/OpenSSH）..."
+        echo "y" | ufw enable >/dev/null 2>&1 || ufw --force enable >/dev/null 2>&1 || true
+      fi
+      ufw status verbose 2>/dev/null | head -n 20 || true
+      log "✅ ufw 已启用"
+      warn "若用非 22 SSH 端口，请先菜单放行该端口再启用"
+      ;;
+    firewalld)
+      systemctl enable firewalld >/dev/null 2>&1 || true
+      systemctl start firewalld >/dev/null 2>&1 || true
+      firewall-cmd --permanent --add-service=ssh >/dev/null 2>&1 || \
+        firewall-cmd --permanent --add-port=22/tcp >/dev/null 2>&1 || true
+      firewall-cmd --reload >/dev/null 2>&1 || true
+      log "✅ firewalld 已启用"
+      firewall-cmd --list-all 2>/dev/null | head -n 30 || true
+      ;;
+    *)
+      err "无可用防火墙"
+      return 1
+      ;;
+  esac
+  warn "云厂商安全组/控制台防火墙也需单独放行端口"
+}
+
+disable_firewall() {
+  require_root || return 1
+
+  echo
+  warn "关闭防火墙会降低安全性"
+  read -rp "确认关闭？(yes/no): " confirm
+  if [ "$confirm" != "yes" ]; then
+    log "已取消"
+    return 0
+  fi
+
+  local fw
+  fw=$(detect_firewall)
+  case "$fw" in
+    ufw)
+      ufw disable >/dev/null 2>&1 || true
+      log "✅ ufw 已关闭"
+      ufw status 2>/dev/null || true
+      ;;
+    firewalld)
+      systemctl stop firewalld >/dev/null 2>&1 || true
+      systemctl disable firewalld >/dev/null 2>&1 || true
+      log "✅ firewalld 已停止并禁用开机启动"
+      ;;
+    *)
+      err "未检测到可关闭的防火墙"
+      return 1
+      ;;
+  esac
+}
+
+allow_firewall_port() {
+  require_root || return 1
+
+  local port="${1:-}"
+  local proto="${2:-tcp}"
+  if [ -z "$port" ]; then
+    read -rp "端口号: " port
+  fi
+  if [ -z "${2:-}" ]; then
+    read -rp "协议 tcp/udp [tcp]: " proto
+    proto=${proto:-tcp}
+  fi
+  proto=$(echo "$proto" | tr '[:upper:]' '[:lower:]')
+  if [[ ! "$proto" =~ ^(tcp|udp)$ ]]; then
+    err "协议只能是 tcp 或 udp"
+    return 1
+  fi
+  if ! is_valid_port "$port"; then
+    err "端口无效: $port"
+    return 1
+  fi
+
+  local fw
+  fw=$(detect_firewall)
+  if [ "$fw" = "none" ]; then
+    warn "未安装防火墙，先安装..."
+    install_firewall || return 1
+    fw=$(detect_firewall)
+  fi
+
+  case "$fw" in
+    ufw)
+      if ufw allow "${port}/${proto}" >/dev/null 2>&1; then
+        log "✅ ufw 已放行 ${port}/${proto}"
+      else
+        err "ufw 放行失败"
+        return 1
+      fi
+      ;;
+    firewalld)
+      if systemctl is-active --quiet firewalld 2>/dev/null; then
+        firewall-cmd --permanent --add-port="${port}/${proto}" >/dev/null 2>&1 || true
+        firewall-cmd --reload >/dev/null 2>&1 || true
+        log "✅ firewalld 已放行 ${port}/${proto}"
+      else
+        err "firewalld 未运行，请先开启防火墙"
+        return 1
+      fi
+      ;;
+    *)
+      # 回退到已有通用逻辑
+      open_firewall_port "$port" "$proto" "手动端口"
+      ;;
+  esac
+}
+
+deny_firewall_port() {
+  require_root || return 1
+
+  local port="${1:-}"
+  local proto="${2:-tcp}"
+  if [ -z "$port" ]; then
+    read -rp "要关闭放行的端口号: " port
+  fi
+  if [ -z "${2:-}" ]; then
+    read -rp "协议 tcp/udp [tcp]: " proto
+    proto=${proto:-tcp}
+  fi
+  proto=$(echo "$proto" | tr '[:upper:]' '[:lower:]')
+  if [[ ! "$proto" =~ ^(tcp|udp)$ ]]; then
+    err "协议只能是 tcp 或 udp"
+    return 1
+  fi
+  if ! is_valid_port "$port"; then
+    err "端口无效: $port"
+    return 1
+  fi
+
+  if [ "$port" = "22" ] && [ "$proto" = "tcp" ]; then
+    warn "你正在移除 22/tcp，可能导致 SSH 无法连入"
+    read -rp "仍要继续？(yes/no): " confirm
+    if [ "$confirm" != "yes" ]; then
+      log "已取消"
+      return 0
+    fi
+  fi
+
+  local fw
+  fw=$(detect_firewall)
+  case "$fw" in
+    ufw)
+      ufw delete allow "${port}/${proto}" >/dev/null 2>&1 || true
+      ufw deny "${port}/${proto}" >/dev/null 2>&1 || true
+      log "✅ 已处理 ufw 规则: ${port}/${proto}（delete allow / deny）"
+      ;;
+    firewalld)
+      if systemctl is-active --quiet firewalld 2>/dev/null; then
+        firewall-cmd --permanent --remove-port="${port}/${proto}" >/dev/null 2>&1 || true
+        firewall-cmd --reload >/dev/null 2>&1 || true
+        log "✅ firewalld 已移除 ${port}/${proto}"
+      else
+        err "firewalld 未运行"
+        return 1
+      fi
+      ;;
+    *)
+      err "未检测到 ufw/firewalld，无法删除端口规则"
+      return 1
+      ;;
+  esac
+}
+
+show_firewall_status() {
+  echo "========================================"
+  echo "🧱 防火墙状态"
+  echo "========================================"
+  local fw
+  fw=$(detect_firewall)
+  echo "检测结果: $fw"
+  echo
+  case "$fw" in
+    ufw)
+      ufw status verbose 2>/dev/null || ufw status 2>/dev/null || true
+      ;;
+    firewalld)
+      systemctl is-active firewalld 2>/dev/null || true
+      firewall-cmd --state 2>/dev/null || true
+      firewall-cmd --list-all 2>/dev/null || true
+      ;;
+    *)
+      echo "未安装 ufw/firewalld"
+      if command -v iptables >/dev/null 2>&1; then
+        echo "iptables INPUT 前 15 条："
+        iptables -S INPUT 2>/dev/null | head -n 15 || true
+      fi
+      ;;
+  esac
+}
+
+harden_firewall_auto() {
+  # 一键加固用：安装 + 放行 22 + 尝试节点端口 + 启用（不交互关墙）
+  require_root || return 1
+
+  install_firewall || return 1
+
+  local fw
+  fw=$(detect_firewall)
+
+  # SSH
+  case "$fw" in
+    ufw)
+      ufw allow OpenSSH >/dev/null 2>&1 || ufw allow 22/tcp >/dev/null 2>&1 || true
+      ;;
+    firewalld)
+      systemctl enable --now firewalld >/dev/null 2>&1 || true
+      firewall-cmd --permanent --add-service=ssh >/dev/null 2>&1 || \
+        firewall-cmd --permanent --add-port=22/tcp >/dev/null 2>&1 || true
+      ;;
+  esac
+
+  # sing-box 端口（有配置则放行）
+  if [ -f /etc/sing-box/config.json ] && command -v jq >/dev/null 2>&1; then
+    local vless_port tuic_port
+    vless_port=$(jq -r '.inbounds[] | select(.type=="vless" and .tag=="vless-reality") | .listen_port' /etc/sing-box/config.json 2>/dev/null | head -n 1)
+    tuic_port=$(jq -r '.inbounds[] | select(.type=="tuic" and .tag=="tuic") | .listen_port' /etc/sing-box/config.json 2>/dev/null | head -n 1)
+    if is_valid_port "${vless_port:-}"; then
+      open_firewall_port "$vless_port" tcp "VLESS Reality" || true
+    fi
+    if is_valid_port "${tuic_port:-}"; then
+      open_firewall_port "$tuic_port" udp "TUIC" || true
+    fi
+  fi
+
+  # Snell 端口（若有配置）
+  if [ -f /etc/snell/snell-server.conf ]; then
+    local snell_port
+    snell_port=$(grep -E '^listen' /etc/snell/snell-server.conf 2>/dev/null | grep -Eo '[0-9]+' | tail -n 1 || true)
+    if is_valid_port "${snell_port:-}"; then
+      open_firewall_port "$snell_port" tcp "Snell" || true
+    fi
+  fi
+
+  enable_firewall || true
+}
+
+firewall_manage() {
+  while true; do
+    echo
+    echo "========================================"
+    echo "🧱 防火墙管理"
+    echo "========================================"
+    echo "1. 安装防火墙（ufw / firewalld）"
+    echo "2. 开启防火墙（自动放行 22/SSH）"
+    echo "3. 关闭防火墙"
+    echo "4. 开放端口"
+    echo "5. 关闭/删除端口放行"
+    echo "6. 查看防火墙状态"
+    echo "0. 返回上级"
+    echo "========================================"
+    read -rp "请选择 [0-6]: " fw_choice
+    case "$fw_choice" in
+      1) install_firewall; read -rp "按回车继续..." ;;
+      2) enable_firewall; read -rp "按回车继续..." ;;
+      3) disable_firewall; read -rp "按回车继续..." ;;
+      4) allow_firewall_port; read -rp "按回车继续..." ;;
+      5) deny_firewall_port; read -rp "按回车继续..." ;;
+      6) show_firewall_status; read -rp "按回车继续..." ;;
+      0) return 0 ;;
+      *) err "无效选择" ;;
+    esac
+  done
+}
+
 one_click_harden() {
   echo "========================================"
   echo "🛡️  一键安全加固"
@@ -1949,9 +2463,10 @@ one_click_harden() {
   echo
   warn "将依次执行以下操作："
   echo "  1. 配置 Swap 内存"
-  echo "  2. 安装 Fail2Ban"
-  echo "  3. SSH 安全加固（生成密钥 → 配置 Termius → 验证 → 禁密码）"
-  echo "  4. 修复 DRM CPU 占用（如适用）"
+  echo "  2. 安装并启用防火墙（放行 22，尝试放行节点端口）"
+  echo "  3. 安装 Fail2Ban"
+  echo "  4. SSH 安全加固（生成密钥 → 配置 Termius → 验证 → 禁密码）"
+  echo "  5. 修复 DRM CPU 占用（如适用）"
   echo
   read -rp "确认执行？(yes/no): " confirm
   if [ "$confirm" != "yes" ]; then
@@ -1960,19 +2475,23 @@ one_click_harden() {
   fi
 
   echo
-  log "【1/4】配置 Swap..."
+  log "【1/5】配置 Swap..."
   setup_swap
 
   echo
-  log "【2/4】安装 Fail2Ban..."
+  log "【2/5】安装并启用防火墙..."
+  harden_firewall_auto
+
+  echo
+  log "【3/5】安装 Fail2Ban..."
   setup_fail2ban
 
   echo
-  log "【3/4】SSH 安全加固..."
+  log "【4/5】SSH 安全加固..."
   harden_ssh
 
   echo
-  log "【4/4】检查 DRM CPU 占用..."
+  log "【5/5】检查 DRM CPU 占用..."
   fix_drm_cpu
 
   echo
@@ -2117,7 +2636,7 @@ main() {
   # 显示菜单
   while true; do
     show_menu
-    read -rp "请选择操作 [0-23]: " choice
+    read -rp "请选择操作 [0-25]: " choice
 
     case "$choice" in
       1)
@@ -2238,12 +2757,20 @@ main() {
         echo
         read -rp "按回车键继续..."
         ;;
+      24)
+        simple_security_check
+        echo
+        read -rp "按回车键继续..."
+        ;;
+      25)
+        firewall_manage
+        ;;
       0)
         log "退出脚本"
         exit 0
         ;;
       *)
-        err "无效选择，请重新输入 [0-23]"
+        err "无效选择，请重新输入 [0-25]"
         echo
         ;;
     esac
