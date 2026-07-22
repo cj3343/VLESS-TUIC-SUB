@@ -844,13 +844,79 @@ _restore_ssh_config() {
   fi
 }
 
+print_ssh_key_create_guide() {
+  local server_ip ssh_ports ssh_port
+  server_ip=$(curl -4s --max-time 3 https://api.ip.sb 2>/dev/null | grep -Eo '([0-9]{1,3}\.){3}[0-9]{1,3}' | head -n 1)
+  server_ip=${server_ip:-服务器IP}
+  ssh_ports=$(get_ssh_ports | paste -sd, - 2>/dev/null || echo 22)
+  ssh_port="${ssh_ports%%,*}"
+  ssh_port=${ssh_port:-22}
+
+  echo "========================================"
+  echo "如何创建 SSH 公钥（在你的电脑执行，不是在服务器执行）"
+  echo "========================================"
+  echo "Mac / Linux:"
+  echo "  mkdir -p ~/.ssh"
+  echo "  ssh-keygen -t ed25519 -f ~/.ssh/${server_ip}-root-ed25519 -C root@${server_ip}"
+  echo "  cat ~/.ssh/${server_ip}-root-ed25519.pub"
+  echo
+  echo "Windows PowerShell:"
+  echo "  ssh-keygen -t ed25519 -f \$env:USERPROFILE\\.ssh\\${server_ip}-root-ed25519 -C root@${server_ip}"
+  echo "  type \$env:USERPROFILE\\.ssh\\${server_ip}-root-ed25519.pub"
+  echo
+  echo "把上面 cat/type 输出的整行 ssh-ed25519 ... 复制回来粘贴。"
+  echo
+  echo "写入公钥后，用新终端测试："
+  if [ "$ssh_port" = "22" ]; then
+    echo "  ssh -i ~/.ssh/${server_ip}-root-ed25519 root@${server_ip}"
+  else
+    echo "  ssh -i ~/.ssh/${server_ip}-root-ed25519 -p ${ssh_port} root@${server_ip}"
+  fi
+  echo
+  echo "测试成功后，回到这里输入 yes，脚本才会禁用密码登录。"
+  echo "========================================"
+}
+
 ssh_key_only_harden() {
   require_root || return 1
   warn "高风险操作：禁用密码登录前，必须确认密钥登录可用。"
   warn "建议：保持当前会话，另开一个终端验证密钥登录成功后再继续。"
 
-  local pub_key
-  read -rp "请输入 root 公钥，留空则仅使用现有 authorized_keys: " pub_key
+  local pub_key mode
+  while true; do
+    echo
+    echo "========================================"
+    echo "SSH 密钥登录加固向导"
+    echo "========================================"
+    echo "1. 我已经有公钥，直接粘贴"
+    echo "2. 查看如何在本地创建公钥"
+    echo "3. 使用服务器现有 authorized_keys"
+    echo "0. 返回"
+    echo "========================================"
+    read -rp "请选择 [0-3]: " mode
+    case "$mode" in
+      1)
+        read -rp "粘贴 root 公钥（ssh-ed25519 ...）: " pub_key
+        break
+        ;;
+      2)
+        print_ssh_key_create_guide
+        read -rp "生成后粘贴 root 公钥；暂时没有就直接回车返回向导: " pub_key
+        [ -n "${pub_key:-}" ] && break
+        ;;
+      3)
+        pub_key=""
+        break
+        ;;
+      0)
+        log "已取消"
+        return 0
+        ;;
+      *)
+        err "无效选择"
+        ;;
+    esac
+  done
 
   if [ -n "$pub_key" ]; then
     if ! echo "$pub_key" | grep -qE '^(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp256|ecdsa-sha2-nistp384|ecdsa-sha2-nistp521|sk-ssh-ed25519@openssh.com|sk-ecdsa-sha2-nistp256@openssh.com) '; then
