@@ -1254,9 +1254,9 @@ delete_allow_rule() {
   case "$fw" in
     ufw)
       if [ -n "$src" ]; then
-        ufw --force delete allow from "$src" to any port "$port" proto "$proto" >/dev/null 2>&1 || true
+        while ufw --force delete allow from "$src" to any port "$port" proto "$proto" >/dev/null 2>&1; do :; done
       else
-        ufw --force delete allow "${port}/${proto}" >/dev/null 2>&1 || true
+        while ufw --force delete allow "${port}/${proto}" >/dev/null 2>&1; do :; done
       fi
       log "已尝试删除放行规则：${src:+from ${src} }${port}/${proto}"
       ;;
@@ -1299,7 +1299,8 @@ deny_port_rule() {
   fw=$(detect_firewall)
   case "$fw" in
     ufw)
-      ufw deny "${port}/${proto}" >/dev/null 2>&1 || return 1
+      while ufw --force delete allow "${port}/${proto}" >/dev/null 2>&1; do :; done
+      ufw insert 1 deny "${port}/${proto}" >/dev/null 2>&1 || ufw deny "${port}/${proto}" >/dev/null 2>&1 || return 1
       log "已禁止：${port}/${proto}"
       ;;
     firewalld)
@@ -1319,23 +1320,23 @@ _parse_port_item() {
   local item="$1"
   local __port_var="$2"
   local __proto_var="$3"
-  local port proto
+  local parsed_port parsed_proto
 
-  port="${item%%/*}"
+  parsed_port="${item%%/*}"
   if [[ "$item" == */* ]]; then
-    proto="${item##*/}"
+    parsed_proto="${item##*/}"
   else
-    proto="tcp"
+    parsed_proto="tcp"
   fi
-  proto=$(echo "$proto" | tr '[:upper:]' '[:lower:]')
-  case "$proto" in
+  parsed_proto=$(echo "$parsed_proto" | tr '[:upper:]' '[:lower:]')
+  case "$parsed_proto" in
     tcp|udp) ;;
     *) return 1 ;;
   esac
-  is_valid_port "$port" || return 1
+  is_valid_port "$parsed_port" || return 1
 
-  printf -v "$__port_var" '%s' "$port"
-  printf -v "$__proto_var" '%s' "$proto"
+  printf -v "$__port_var" '%s' "$parsed_port"
+  printf -v "$__proto_var" '%s' "$parsed_proto"
 }
 
 _show_firewall_after_manual_change() {
