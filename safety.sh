@@ -1223,13 +1223,142 @@ panel_whitelist_menu() {
   esac
 }
 
-# 手动补充放行（解析失败或自定义端口时用）
-manual_allow_ports() {
+is_ssh_port() {
+  local port="$1" p
+  for p in $(get_ssh_ports); do
+    [ "$p" = "$port" ] && return 0
+  done
+  return 1
+}
+
+delete_allow_rule() {
+  local port="$1"
+  local proto="${2:-tcp}"
+  local src="${3:-}"
+  local fw family rule
+
+  if ! is_valid_port "$port"; then
+    err "无效端口：$port"
+    return 1
+  fi
+  case "$proto" in
+    tcp|udp) ;;
+    *) err "无效协议：$proto"; return 1 ;;
+  esac
+  if [ -n "$src" ] && ! is_valid_ip "$src"; then
+    err "无效源地址：$src"
+    return 1
+  fi
+
+  fw=$(detect_firewall)
+  case "$fw" in
+    ufw)
+      if [ -n "$src" ]; then
+        ufw --force delete allow from "$src" to any port "$port" proto "$proto" >/dev/null 2>&1 || true
+      else
+        ufw --force delete allow "${port}/${proto}" >/dev/null 2>&1 || true
+      fi
+      log "已尝试删除放行规则：${src:+from ${src} }${port}/${proto}"
+      ;;
+    firewalld)
+      if [ -n "$src" ]; then
+        if is_ipv6_addr "$src"; then family="ipv6"; else family="ipv4"; fi
+        rule="rule family=\"${family}\" source address=\"${src}\" port port=\"${port}\" protocol=\"${proto}\" accept"
+        firewall-cmd --permanent --remove-rich-rule="${rule}" >/dev/null 2>&1 || true
+      else
+        firewall-cmd --permanent --remove-port="${port}/${proto}" >/dev/null 2>&1 || true
+      fi
+      firewall-cmd --reload >/dev/null 2>&1 || true
+      log "已尝试删除放行规则：${src:+from ${src} }${port}/${proto}"
+      ;;
+    *)
+      err "未检测到防火墙，无法删除规则"
+      return 1
+      ;;
+  esac
+}
+
+deny_port_rule() {
+  local port="$1"
+  local proto="${2:-tcp}"
+  local fw
+
+  if ! is_valid_port "$port"; then
+    err "无效端口：$port"
+    return 1
+  fi
+  case "$proto" in
+    tcp|udp) ;;
+    *) err "无效协议：$proto"; return 1 ;;
+  esac
+  if is_ssh_port "$port"; then
+    warn "你正在禁止 SSH 端口 ${port}/${proto}，这可能导致无法登录"
+    confirm_yes "确认禁止 SSH 端口？(yes/no): " || { log "已取消"; return 0; }
+  fi
+
+  fw=$(detect_firewall)
+  case "$fw" in
+    ufw)
+      ufw deny "${port}/${proto}" >/dev/null 2>&1 || return 1
+      log "已禁止：${port}/${proto}"
+      ;;
+    firewalld)
+      warn "firewalld 没有简单等价的永久 deny-port；将移除 allow-port。若需显式 drop，请手动添加 rich-rule。"
+      firewall-cmd --permanent --remove-port="${port}/${proto}" >/dev/null 2>&1 || true
+      firewall-cmd --reload >/dev/null 2>&1 || true
+      log "已移除 firewalld 放行：${port}/${proto}"
+      ;;
+    *)
+      err "未检测到防火墙，无法禁止端口"
+      return 1
+      ;;
+  esac
+}
+
+_parse_port_item() {
+  local item="$1"
+  local __port_var="$2"
+  local __proto_var="$3"
+  local port proto
+
+  port="${item%%/*}"
+  if [[ "$item" == */* ]]; then
+    proto="${item##*/}"
+  else
+    proto="tcp"
+  fi
+  proto=$(echo "$proto" | tr '[:upper:]' '[:lower:]')
+  case "$proto" in
+    tcp|udp) ;;
+    *) return 1 ;;
+  esac
+  is_valid_port "$port" || return 1
+
+  printf -v "$__port_var" '%s' "$port"
+  printf -v "$__proto_var" '%s' "$proto"
+}
+
+_show_firewall_after_manual_change() {
+  case "$(detect_firewall)" in
+    ufw)
+      if ! ufw status 2>/dev/null | grep -qi 'Status: active'; then
+        warn "ufw 尚未启用；规则已添加，需菜单 3 或 ufw enable 后生效"
+      fi
+      ufw status verbose | head -n 60
+      ;;
+    firewalld)
+      firewall-cmd --reload >/dev/null 2>&1 || true
+      firewall-cmd --list-all
+      ;;
+  esac
+}
+
+manual_allow_global_ports() {
   require_root || return 1
   install_firewall_if_needed || return 1
 
   echo "========================================"
-  echo "手动放行端口"
+  echo "手动放行端口（全网）"
   echo "========================================"
   echo "格式示例："
   echo "  443/tcp"
@@ -1245,34 +1374,144 @@ manual_allow_ports() {
   line=${line//,/ }
   backup_firewall_state
   for item in $line; do
-    port="${item%%/*}"
-    if [[ "$item" == */* ]]; then
-      proto="${item##*/}"
-    else
-      proto="tcp"
+    if ! _parse_port_item "$item" port proto; then
+      warn "跳过无效端口：$item"
+      continue
     fi
-    proto=$(echo "$proto" | tr '[:upper:]' '[:lower:]')
-    case "$proto" in
-      tcp|udp) ;;
-      *) warn "跳过无效协议：$item"; continue ;;
-    esac
     name="manual/${port}"
     allow_port "$port" "$proto" "$name" || fail=1
   done
 
-  case "$(detect_firewall)" in
-    ufw)
-      if ! ufw status 2>/dev/null | grep -qi 'Status: active'; then
-        warn "ufw 尚未启用；规则已添加，需菜单 3 或 ufw enable 后生效"
-      fi
-      ufw status verbose | head -n 50
-      ;;
-    firewalld)
-      firewall-cmd --reload >/dev/null 2>&1 || true
-      firewall-cmd --list-all
-      ;;
-  esac
+  _show_firewall_after_manual_change
   [ "$fail" -eq 0 ] || return 1
+}
+
+manual_allow_ip_ports() {
+  require_root || return 1
+  install_firewall_if_needed || return 1
+
+  echo "========================================"
+  echo "指定 IP/CIDR 放行端口"
+  echo "========================================"
+  echo "端口格式：443/tcp 443/udp 8443"
+  echo "源地址示例：203.0.113.10 或 203.0.113.0/24"
+  echo "源地址直接回车 = 全网放行"
+  echo "========================================"
+  local line src item port proto name fail=0
+  read -rp "端口列表: " line
+  [ -n "${line:-}" ] || { log "已取消"; return 0; }
+  read -rp "源 IP/CIDR [回车=全网]: " src
+  if [ -n "${src:-}" ] && ! is_valid_ip "$src"; then
+    err "源地址无效"
+    return 1
+  fi
+
+  line=${line//,/ }
+  backup_firewall_state
+  for item in $line; do
+    if ! _parse_port_item "$item" port proto; then
+      warn "跳过无效端口：$item"
+      continue
+    fi
+    name="manual/${port}"
+    if [ -n "${src:-}" ]; then
+      allow_port_from "$src" "$port" "$proto" "$name" || fail=1
+    else
+      allow_port "$port" "$proto" "$name" || fail=1
+    fi
+  done
+  _show_firewall_after_manual_change
+  [ "$fail" -eq 0 ] || return 1
+}
+
+manual_delete_allow_ports() {
+  require_root || return 1
+  install_firewall_if_needed || return 1
+
+  echo "========================================"
+  echo "删除端口放行规则"
+  echo "========================================"
+  echo "端口格式：443/tcp 443/udp 8443"
+  echo "如果原规则是指定 IP 放行，请输入对应源 IP/CIDR；回车则删除全网放行规则。"
+  echo "========================================"
+  local line src item port proto fail=0
+  read -rp "端口列表: " line
+  [ -n "${line:-}" ] || { log "已取消"; return 0; }
+  read -rp "源 IP/CIDR [回车=全网规则]: " src
+  if [ -n "${src:-}" ] && ! is_valid_ip "$src"; then
+    err "源地址无效"
+    return 1
+  fi
+
+  line=${line//,/ }
+  backup_firewall_state
+  for item in $line; do
+    if ! _parse_port_item "$item" port proto; then
+      warn "跳过无效端口：$item"
+      continue
+    fi
+    if is_ssh_port "$port"; then
+      warn "你正在删除 SSH 端口 ${port}/${proto} 的放行规则，可能导致无法登录"
+      confirm_yes "确认删除 SSH 端口放行？(yes/no): " || { log "跳过 ${port}/${proto}"; continue; }
+    fi
+    delete_allow_rule "$port" "$proto" "$src" || fail=1
+  done
+  _show_firewall_after_manual_change
+  [ "$fail" -eq 0 ] || return 1
+}
+
+manual_deny_ports() {
+  require_root || return 1
+  install_firewall_if_needed || return 1
+
+  echo "========================================"
+  echo "禁止端口"
+  echo "========================================"
+  echo "端口格式：443/tcp 443/udp 8443"
+  echo "说明：ufw 会添加 deny；firewalld 会移除对应 allow-port。"
+  echo "========================================"
+  local line item port proto fail=0
+  read -rp "端口列表: " line
+  [ -n "${line:-}" ] || { log "已取消"; return 0; }
+
+  line=${line//,/ }
+  backup_firewall_state
+  for item in $line; do
+    if ! _parse_port_item "$item" port proto; then
+      warn "跳过无效端口：$item"
+      continue
+    fi
+    deny_port_rule "$port" "$proto" || fail=1
+  done
+  _show_firewall_after_manual_change
+  [ "$fail" -eq 0 ] || return 1
+}
+
+manual_allow_ports() {
+  while true; do
+    echo
+    echo "========================================"
+    echo "手动端口管理"
+    echo "========================================"
+    echo "1. 全网放行端口"
+    echo "2. 指定 IP/CIDR 放行端口"
+    echo "3. 删除端口放行规则"
+    echo "4. 禁止端口"
+    echo "5. 查看当前防火墙规则"
+    echo "0. 返回"
+    echo "========================================"
+    local sub
+    read -rp "请选择 [0-5]: " sub
+    case "$sub" in
+      1) manual_allow_global_ports ;;
+      2) manual_allow_ip_ports ;;
+      3) manual_delete_allow_ports ;;
+      4) manual_deny_ports ;;
+      5) _show_firewall_after_manual_change ;;
+      0) return 0 ;;
+      *) err "无效选择" ;;
+    esac
+  done
 }
 
 # 日志与近期安全事件
